@@ -9,6 +9,7 @@ mod fb;
 mod firmware;
 mod gfw;
 mod gpu;
+mod nvfw;
 mod regs;
 mod util;
 mod vbios;
