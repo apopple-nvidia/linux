@@ -6,9 +6,11 @@
 use core::marker::PhantomData;
 
 use kernel::device;
+use kernel::elf;
 use kernel::firmware;
 use kernel::prelude::*;
 use kernel::str::CString;
+use radix3::RadixFirmware;
 use riscv::RiscvFirmware;
 use sec2::Sec2Firmware;
 
@@ -20,6 +22,7 @@ use crate::gpu;
 use crate::gpu::Chipset;
 
 pub(crate) mod fwsec;
+pub(crate) mod radix3;
 pub(crate) mod riscv;
 pub(crate) mod sec2;
 
@@ -28,10 +31,11 @@ pub(crate) const FIRMWARE_VERSION: &str = "570.144";
 /// Structure encapsulating the firmware blobs required for the GPU to operate.
 #[expect(dead_code)]
 pub(crate) struct Firmware {
-    booter_load: Sec2Firmware,
-    booter_unload: Sec2Firmware,
+    pub booter_load: Sec2Firmware,
+    pub booter_unload: Sec2Firmware,
     pub bootloader: RiscvFirmware,
-    pub gsp: firmware::Firmware,
+    pub gsp: RadixFirmware,
+    pub gsp_sigs: DmaObject,
 }
 
 impl Firmware {
@@ -50,13 +54,37 @@ impl Firmware {
                 .and_then(|path| firmware::Firmware::request(&path, dev))
         };
 
+        let gsp_fw = request("gsp")?;
+        let gsp_elf = elf::Parser::new(gsp_fw.data())?;
+        let gsp = {
+            let data = gsp_elf
+                .sections_iter()?
+                .filter_map(Result::ok)
+                .find(|section| section.name == ".fwimage")
+                .map(|section| section.data)
+                .ok_or(EINVAL)?;
+
+            RadixFirmware::new(dev, ".fwimage", data)?
+        };
+
+        // TODO: make this a GPU-specific const.
+        let gsp_sigs_section = ".fwsignature_ga10x";
+        let gsp_sigs = gsp_elf
+            .sections_iter()?
+            .filter_map(Result::ok)
+            .find(|section| section.name == gsp_sigs_section)
+            .map(|section| section.data)
+            .ok_or(EINVAL)
+            .and_then(|data| DmaObject::from_data(dev, data))?;
+
         Ok(Firmware {
             booter_load: request("booter_load")
                 .and_then(|fw| Sec2Firmware::new(sec2, dev, bar, &fw))?,
             booter_unload: request("booter_unload")
                 .and_then(|fw| Sec2Firmware::new(sec2, dev, bar, &fw))?,
             bootloader: request("bootloader").and_then(|fw| RiscvFirmware::new(dev, &fw))?,
-            gsp: request("gsp")?,
+            gsp,
+            gsp_sigs,
         })
     }
 }
