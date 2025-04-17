@@ -6,6 +6,7 @@ use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
 use crate::fb::FbLayout;
 use crate::fb::SysmemFlush;
+use crate::firmware::booter::{BooterFirmware, BooterKind};
 use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::{Firmware, FIRMWARE_VERSION};
 use crate::gfw;
@@ -283,6 +284,15 @@ impl Gpu {
         dev_dbg!(dev, "{:#x?}\n", fb_layout);
 
         self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;
+
+        let _booter_loader = BooterFirmware::new(
+            dev,
+            BooterKind::Loader,
+            self.spec.chipset,
+            FIRMWARE_VERSION,
+            &self.sec2_falcon,
+            bar,
+        )?;
 
         Ok(())
     }
