@@ -15,6 +15,8 @@ use crate::falcon::FalconFirmware;
 use crate::gpu;
 use crate::gpu::Chipset;
 
+pub(crate) mod fwsec;
+
 pub(crate) const FIRMWARE_VERSION: &str = "535.113.01";
 
 /// Structure encapsulating the firmware blobs required for the GPU to operate.
@@ -98,7 +100,6 @@ struct FirmwareDmaObject<F: FalconFirmware>(DmaObject, PhantomData<F>);
 /// This is module-local and meant for sub-modules to use internally.
 trait FirmwareSignature<F: FalconFirmware>: AsRef<[u8]> {}
 
-#[expect(unused)]
 impl<F: FalconFirmware> FirmwareDmaObject<F> {
     /// Creates a new `UcodeDmaObject` containing `data`.
     fn new(dev: &device::Device<device::Bound>, data: &[u8]) -> Result<Self> {
