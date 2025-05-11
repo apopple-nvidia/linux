@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
 
-OPEN_GPU_KERNEL_VERSION := r$(subst .,_,$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_VERSION))
-
 # TODO: The next bit has been stolen from rust/Makefile, so we need to move it
 # somewhere that modules can use rather than cutting and pasting.
 
@@ -97,14 +95,16 @@ quiet_cmd_bindgen = BINDGEN $@
 		$(bindgen_target_cflags) $(bindgen_target_extra)
 
 ifdef CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH
-bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/common/sdk/nvidia/inc
+
+include $(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/version.mk
+OPEN_GPU_KERNEL_VERSION := r$(subst .,_,$(NVIDIA_VERSION))
+
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/inc/kernel
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/generated
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/inc/libraries
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/arch/nvalloc/common/inc
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/common/inc
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/kernel/inc
-bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/kernel-open/common/inc
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/inc
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/nvidia/interface
 bindgen_c_flags_final += -I$(CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH)/src/common/nvlink/inband/interface
@@ -132,20 +132,20 @@ bindgen_c_flags_final += -DPORT_MODULE_example=0
 bindgen_c_flags_final += -DPORT_MODULE_mmio=0
 bindgen_c_flags_final += -DPORT_MODULE_time=0
 
-$(obj)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.rs: $(src)/nvfw/r570_144_bindings.h \
+$(obj)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.rs: $(src)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.h \
     $(srctree)/rust/bindgen_parameters FORCE
 	$(Q)mkdir -p $(obj)/nvfw
 	$(call if_changed_dep,bindgen)
-else
-$(error "Must specify CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH")
-endif
-
 $(obj)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.rs: private bindgen_target_flags = \
     $(shell grep -Ev '^#|^$$' $(srctree)/rust/bindgen_parameters)
 $(obj)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.rs: private bindgen_target_flags += \
-    $(foreach item,$(CONFIG_NVIDIA_OPEN_GPU_SYMBOLS),\
+    $(foreach item,$(shell cat $(src)/nvidia-open-gpu-symbols.txt),\
         $(if $(filter type:%,$(item)),--allowlist-type=$(patsubst type:%,%,$(item)),\
         $(if $(filter var:%,$(item)),--allowlist-var=$(patsubst var:%,%,$(item)))))
 
 $(obj)/nova_core.o: $(obj)/nvfw/$(OPEN_GPU_KERNEL_VERSION)_bindings.rs
 obj-$(CONFIG_NOVA_CORE) += nova_core.o
+
+else
+$(error "Must specify CONFIG_NVIDIA_OPEN_GPU_KERNEL_PATH")
+endif

@@ -25,17 +25,3 @@ config NVIDIA_OPEN_GPU_KERNEL_PATH
 
 	  If unset the existing in-tree Nouveau copy of these headers will be used
 	  instead.
-
-config NVIDIA_OPEN_GPU_KERNEL_VERSION
-	string "OpenRM header version"
-	depends on NOVA_CORE
-	default "535.113.01"
-	help
-	  Version of the headers used to generate the OpenRM Rust bindings.
-
-config NVIDIA_OPEN_GPU_SYMBOLS
-	string "OpenRM symbols to generate Rust bindings for"
-	depends on NOVA_CORE
-	default "type:GspStaticConfigInfo_t var:NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO type:GspFwWprMeta var:GSP_FW_WPR_META_MAGIC var:GSP_FW_WPR_META_REVISION type:LibosMemoryRegionKind type:LibosMemoryRegionLoc type:LibosMemoryRegionInitArgument type:GSP_ARGUMENTS_CACHED var:NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3"
-	help
-	  Space separated list of OpenRM symbols to generate Rust bindings for.
