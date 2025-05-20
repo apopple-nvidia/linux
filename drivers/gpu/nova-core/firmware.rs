@@ -3,11 +3,15 @@
 //! Contains structures and functions dedicated to the parsing, building and patching of firmwares
 //! to be loaded into a given execution unit.
 
+use core::marker::PhantomData;
+
 use kernel::device;
 use kernel::firmware;
 use kernel::prelude::*;
 use kernel::str::CString;
 
+use crate::dma::DmaObject;
+use crate::falcon::FalconFirmware;
 use crate::gpu;
 use crate::gpu::Chipset;
 
@@ -81,6 +85,46 @@ impl FalconUCodeDescV3 {
         const HDR_SIZE_MASK: u32 = 0xffff0000;
 
         ((self.hdr & HDR_SIZE_MASK) >> HDR_SIZE_SHIFT) as usize
+    }
+}
+
+/// A [`DmaObject`] containing a specific microcode ready to be loaded into a falcon.
+///
+/// This is module-local and meant for sub-modules to use internally.
+struct FirmwareDmaObject<F: FalconFirmware>(DmaObject, PhantomData<F>);
+
+/// Trait for signatures to be patched directly into a given firmware.
+///
+/// This is module-local and meant for sub-modules to use internally.
+trait FirmwareSignature<F: FalconFirmware>: AsRef<[u8]> {}
+
+#[expect(unused)]
+impl<F: FalconFirmware> FirmwareDmaObject<F> {
+    /// Creates a new `UcodeDmaObject` containing `data`.
+    fn new(dev: &device::Device<device::Bound>, data: &[u8]) -> Result<Self> {
+        DmaObject::from_data(dev, data).map(|dmaobj| Self(dmaobj, PhantomData))
+    }
+
+    /// Patches the firmware at offset `sig_base_img` with `signature`.
+    fn patch_signature<S: FirmwareSignature<F>>(
+        &mut self,
+        signature: &S,
+        sig_base_img: usize,
+    ) -> Result {
+        let signature_bytes = signature.as_ref();
+        if sig_base_img + signature_bytes.len() > self.0.size() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: we are the only user of this object, so there cannot be any race.
+        let dst = unsafe { self.0.start_ptr_mut().add(sig_base_img) };
+
+        // SAFETY: `signature` and `dst` are valid, properly aligned, and do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(signature_bytes.as_ptr(), dst, signature_bytes.len())
+        };
+
+        Ok(())
     }
 }
 
