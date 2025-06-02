@@ -305,7 +305,7 @@ impl Gpu {
             return Err(EIO);
         }
 
-        dev_dbg!(pdev.as_ref(), "WPR2: {:#x}-{:#x}\n", wpr2_lo, wpr2_hi);
+        dev_info!(pdev.as_ref(), "WPR2: {:#x}-{:#x}\n", wpr2_lo, wpr2_hi);
 
         let _libos = crate::gsp::GspSharedMemObjects::new(pdev.as_ref())?;
 
