@@ -1103,7 +1103,12 @@ impl FwSecBiosImage {
         // Return a reference to the FalconUCodeDescV3 structure SAFETY: we have checked that
         // `falcon_ucode_offset + size_of::<FalconUCodeDescV3>` is within the bounds of `data.`
         Ok(unsafe {
-            &*(self.base.data.as_ptr().add(falcon_ucode_offset) as *const FalconUCodeDescV3)
+            &*(self
+                .base
+                .data
+                .as_ptr()
+                .add(falcon_ucode_offset)
+                .cast::<FalconUCodeDescV3>())
         })
     }
     /// Get the ucode data as a byte slice
