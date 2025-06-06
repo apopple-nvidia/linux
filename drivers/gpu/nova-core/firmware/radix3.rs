@@ -151,11 +151,11 @@ impl RadixFirmware {
         })
     }
 
-    pub fn lvl0_dma_handle(&self) -> bindings::dma_addr_t {
+    pub(crate) fn lvl0_dma_handle(&self) -> bindings::dma_addr_t {
         self.lvl0.dma_handle()
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.size
     }
 }
