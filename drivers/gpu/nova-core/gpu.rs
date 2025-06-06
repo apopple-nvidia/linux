@@ -343,6 +343,8 @@ impl Gpu {
             gsp_falcon.is_riscv_active(&bar)?,
         );
 
+        libos.cmdq.receive()?.dump();
+
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
