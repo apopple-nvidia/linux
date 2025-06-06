@@ -3,7 +3,6 @@
 //! Numerical and binary utilities for primitive types.
 
 /// Extension trait providing useful methods for the kernel on integers.
-#[const_trait]
 pub trait NumExt {
     /// Align `self` down to `alignment`.
     ///
@@ -60,7 +59,7 @@ pub trait NumExt {
 macro_rules! numext_impl {
     ($($t:ty),+) => {
         $(
-            impl const NumExt for $t {
+            impl NumExt for $t {
                 #[inline]
                 fn align_down(self, alignment: Self) -> Self {
                     self & !alignment.wrapping_sub(1)
