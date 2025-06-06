@@ -336,6 +336,13 @@ impl Gpu {
         dev_info!(pdev.as_ref(), "MBOX: {:#x},{:#x}\n", mbox0, mbox1,);
         dev_info!(pdev.as_ref(), "WPR2: {:#x}-{:#x}\n", wpr2_lo, wpr2_hi);
 
+        dev_info!(pdev.as_ref(), "GPU instance built\n");
+        dev_info!(
+            pdev.as_ref(),
+            "RISC-V active? {}\n",
+            gsp_falcon.is_riscv_active(&bar)?,
+        );
+
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
