@@ -5,3 +5,8 @@
 #include <gpu/gsp/gsp_init_args.h>
 #include <gsp/gsp_fw_wpr_meta.h>
 #include <libos_init_args.h>
+#include <generated/g_os_nvoc.h>
+
+#define RPC_STRUCTURES
+#include <generated/g_rpc-structures.h>
+#include <rmgspseq.h>
