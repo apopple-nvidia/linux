@@ -81,13 +81,3 @@ macro_rules! numext_impl {
 }
 
 numext_impl!(usize, u8, u16, u32, u64, u128);
-
-/// Const version of [`NumExt::align_down`].
-pub const fn align_down_u8(n: u8, alignment: u8) -> u8 {
-    n & !alignment.wrapping_sub(1)
-}
-
-/// Const version of [`NumExt::fls`].
-pub const fn fls_u8(n: u8) -> u32 {
-    u8::BITS - n.leading_zeros()
-}
