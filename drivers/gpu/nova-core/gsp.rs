@@ -2,6 +2,7 @@
 
 mod boot;
 
+use kernel::alloc::flags::GFP_KERNEL;
 use kernel::device;
 use kernel::dma::CoherentAllocation;
 use kernel::dma::DmaAddress;
@@ -11,12 +12,15 @@ use kernel::prelude::*;
 use kernel::transmute::AsBytes;
 
 use crate::fb::FbLayout;
+use crate::gsp::cmdq::Cmdq;
 
 pub(crate) use fw::{GspFwWprMeta, LibosParams};
 
 mod fw;
 
 use fw::LibosMemoryRegionInitArgument;
+
+pub(crate) mod cmdq;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
@@ -31,6 +35,7 @@ pub(crate) struct Gsp {
     loginit: LogBuffer,
     logintr: LogBuffer,
     logrm: LogBuffer,
+    pub(crate) cmdq: Cmdq,
 }
 
 #[repr(C)]
@@ -110,11 +115,15 @@ impl Gsp {
         let logrm = LogBuffer::new(dev)?;
         dma_write!(libos[2] = LibosMemoryRegionInitArgument::new("LOGRM", &logrm.0)?)?;
 
+        // Creates its own PTE array.
+        let cmdq = Cmdq::new(dev)?;
+
         Ok(try_pin_init!(Self {
             libos,
             loginit,
             logintr,
             logrm,
+            cmdq,
         }))
     }
 }
