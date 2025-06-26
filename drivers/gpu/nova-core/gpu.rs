@@ -410,6 +410,7 @@ impl Gpu {
         libos
             .cmdq
             .run_sequencer(bar, &gsp_falcon, &sec2_falcon, &fw, Delta::from_secs(10))?;
+        libos.cmdq.gsp_init_done(Delta::from_secs(10))?;
 
         Ok(pin_init!(Self {
             spec,
