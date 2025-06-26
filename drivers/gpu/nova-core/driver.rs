@@ -6,11 +6,11 @@ use kernel::{
 };
 
 use crate::gpu::Gpu;
+use crate::gsp::GspMemObjects;
 
 #[pin_data]
 pub(crate) struct NovaCore {
-    // Placeholder for the real `Gsp` object once it is built.
-    pub(crate) gsp: (),
+    pub(crate) gsp: GspMemObjects,
     #[pin]
     pub(crate) gpu: Gpu,
     _reg: auxiliary::Registration,

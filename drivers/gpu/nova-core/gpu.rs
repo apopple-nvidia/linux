@@ -11,6 +11,7 @@ use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::gsp::GspFirmware;
 use crate::firmware::FIRMWARE_VERSION;
 use crate::gfw;
+use crate::gsp::{self, GspMemObjects};
 use crate::regs;
 use crate::vbios::Vbios;
 use core::fmt;
@@ -273,7 +274,7 @@ impl Gpu {
     /// structures that the GSP will use at runtime.
     ///
     /// Upon return, the GSP is up and running, and its runtime object given as return value.
-    pub(crate) fn start_gsp(&self, pdev: &pci::Device<device::Bound>) -> Result<()> {
+    pub(crate) fn start_gsp(&self, pdev: &pci::Device<device::Bound>) -> Result<GspMemObjects> {
         let dev = pdev.as_ref();
 
         let bar = self.bar.access(dev)?;
@@ -290,6 +291,8 @@ impl Gpu {
 
         self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;
 
+        let libos = gsp::GspMemObjects::new(pdev)?;
+
         let _booter_loader = BooterFirmware::new(
             dev,
             BooterKind::Loader,
@@ -299,7 +302,7 @@ impl Gpu {
             bar,
         )?;
 
-        Ok(())
+        Ok(libos)
     }
 
     pub(crate) fn new(
