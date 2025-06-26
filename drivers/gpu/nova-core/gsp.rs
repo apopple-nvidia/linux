@@ -11,6 +11,8 @@ use kernel::prelude::*;
 use kernel::ptr::Alignment;
 use kernel::transmute::AsBytes;
 
+use crate::fb::FbLayout;
+
 pub(crate) use fw::{GspFwWprMeta, LibosParams};
 
 mod fw;
