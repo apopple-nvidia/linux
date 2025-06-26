@@ -12,8 +12,10 @@ use crate::firmware::gsp::GspFirmware;
 use crate::firmware::FIRMWARE_VERSION;
 use crate::gfw;
 use crate::gsp::{self, GspMemObjects};
+use crate::nvfw::GspFwWprMeta;
 use crate::regs;
 use crate::vbios::Vbios;
+
 use core::fmt;
 
 macro_rules! define_chipset {
@@ -301,6 +303,8 @@ impl Gpu {
             &self.sec2_falcon,
             bar,
         )?;
+
+        let _wpr_meta = GspFwWprMeta::new(dev, &gsp_fw, &fb_layout)?;
 
         Ok(libos)
     }
