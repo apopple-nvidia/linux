@@ -46,4 +46,11 @@ pub(crate) use r570_144::{
     LibosMemoryRegionInitArgument,
     LibosMemoryRegionKind_LIBOS_MEMORY_REGION_CONTIGUOUS,
     LibosMemoryRegionLoc_LIBOS_MEMORY_REGION_LOC_SYSMEM,
+
+    // GSP firmware constants
+    GSP_FW_WPR_META_MAGIC,
+    GSP_FW_WPR_META_REVISION,
 };
+
+pub(crate) type GspFwWprMetaBootResumeInfo = r570_144::GspFwWprMeta__bindgen_ty_1;
+pub(crate) type GspFwWprMetaBootInfo = r570_144::GspFwWprMeta__bindgen_ty_1__bindgen_ty_1;

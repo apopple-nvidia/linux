@@ -94,7 +94,6 @@ impl GspFirmware {
         })
     }
 
-    #[expect(unused)]
     /// Returns the DMA handle of the level 0 page table.
     pub(crate) fn lvl0_dma_handle(&self) -> DmaAddress {
         self.lvl0.dma_handle()
