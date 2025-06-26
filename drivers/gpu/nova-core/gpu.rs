@@ -9,6 +9,7 @@ use crate::fb::SysmemFlush;
 use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::{Firmware, FIRMWARE_VERSION};
 use crate::gfw;
+use crate::gsp;
 use crate::regs;
 use crate::util;
 use crate::vbios::Vbios;
@@ -172,6 +173,7 @@ pub(crate) struct Gpu {
     /// System memory page required for flushing all pending GPU-side memory writes done through
     /// PCIE into system memory, via sysmembar (A GPU-initiated HW memory-barrier operation).
     sysmem_flush: SysmemFlush,
+    libos: gsp::GspMemObjects,
 }
 
 #[pinned_drop]
@@ -309,11 +311,15 @@ impl Gpu {
 
         Self::run_fwsec_frts(pdev.as_ref(), &gsp_falcon, bar, &bios, &fb_layout)?;
 
+        let libos = gsp::GspMemObjects::new(pdev)?;
+        let _libos_handle = libos.libos_dma_handle();
+
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
             fw,
             sysmem_flush,
+            libos,
         }))
     }
 }

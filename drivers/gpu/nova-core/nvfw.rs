@@ -40,3 +40,10 @@ pub(crate) use r570_144::GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB;
 /// Structure passed to the GSP bootloader, containing the framebuffer layout as well as the DMA
 /// addresses of the GSP bootloader and firmware.
 pub(crate) use r570_144::GspFwWprMeta;
+
+pub(crate) use r570_144::{
+    // LibOS memory structures
+    LibosMemoryRegionInitArgument,
+    LibosMemoryRegionKind_LIBOS_MEMORY_REGION_CONTIGUOUS,
+    LibosMemoryRegionLoc_LIBOS_MEMORY_REGION_LOC_SYSMEM,
+};
