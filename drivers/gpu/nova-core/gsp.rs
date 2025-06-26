@@ -34,7 +34,7 @@ const RM_LOG_BUFFER_NUM_PAGES: usize = 0x10;
 /// GSP runtime data.
 #[pin_data]
 pub(crate) struct Gsp {
-    libos: CoherentAllocation<LibosMemoryRegionInitArgument>,
+    pub libos: CoherentAllocation<LibosMemoryRegionInitArgument>,
     pub loginit: CoherentAllocation<u8>,
     pub logintr: CoherentAllocation<u8>,
     pub logrm: CoherentAllocation<u8>,
