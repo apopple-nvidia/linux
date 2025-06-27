@@ -25,7 +25,6 @@ use crate::fb::FbLayout;
 use crate::firmware::Firmware;
 use crate::nvfw::r570_144 as fw;
 use crate::regs::NV_PGSP_QUEUE_HEAD;
-use crate::util::wait_on;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
