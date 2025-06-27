@@ -410,6 +410,12 @@ impl Gpu {
             core::str::from_utf8(&info.gpu_name).unwrap_or("invalid")
         );
 
+        // TODO: Figure out how to convince the compiler that the lifetime
+        // parameter on GspMemObjects is satisfied when we pass it to
+        // pin_init below. For now we just leak the memory, which is not good
+        // but is better than a use-after-free.
+        core::mem::forget(libos);
+
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
