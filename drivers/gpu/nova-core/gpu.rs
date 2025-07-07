@@ -181,6 +181,8 @@ pub(crate) struct Gpu {
     /// PCIE into system memory.
     sysmem_flush: SysmemFlush,
     wpr_meta: CoherentAllocation<fw::GspFwWprMeta>,
+    /// GSP information
+    gsp_info: gsp::GspInfo,
 }
 
 #[pinned_drop]
@@ -392,7 +394,11 @@ impl Gpu {
 
         libos.cmdq.run_sequencer(Delta::from_secs(10))?;
         libos.cmdq.gsp_init_done(Delta::from_secs(10))?;
-        libos.cmdq.get_gsp_info()?;
+        let gsp_info = libos.cmdq.get_gsp_info()?;
+
+        dev_info!(pdev.as_ref(), "GPU Name: {}\n", gsp_info.gpu_name.to_str().unwrap_or("invalid utf8"));
+        dev_info!(pdev.as_ref(), "GSP Handles: Client={:#x}, Device={:#x}, Subdevice={:#x}\n", 
+                  gsp_info.h_internal_client, gsp_info.h_internal_device, gsp_info.h_internal_subdevice);
 
         // TODO: Figure out how to convince the compiler that the lifetime
         // parameter on GspSharedMemObjects is satisfied when we pass it to
@@ -411,6 +417,7 @@ impl Gpu {
             fw,
             sysmem_flush,
             wpr_meta,
+            gsp_info,
         }))
     }
 }

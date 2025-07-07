@@ -14,7 +14,7 @@ use kernel::dma::CoherentAllocation;
 use kernel::pci;
 use kernel::pr_info;
 use kernel::prelude::*;
-use kernel::str::CStr;
+use kernel::str::{CStr, CString};
 use kernel::time::Delta;
 use kernel::transmute::{AsBytes, FromBytes};
 use kernel::{dma_read, dma_write};
@@ -33,6 +33,15 @@ pub(crate) mod sequencer;
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
 pub(crate) const GSP_HEAP_SHIFT: u64 = 1 << 20;
+
+/// Structure containing GSP information including handles and GPU name
+#[derive(Debug)]
+pub(crate) struct GspInfo {
+    pub h_internal_client: u32,
+    pub h_internal_device: u32,
+    pub h_internal_subdevice: u32,
+    pub gpu_name: CString,
+}
 
 unsafe impl FromBytes for fw::GSP_ARGUMENTS_CACHED {}
 unsafe impl AsBytes for fw::GSP_ARGUMENTS_CACHED {}
@@ -825,7 +834,7 @@ impl<'a> GspCmdq<'a> {
         Ok(())
     }
 
-    pub(crate) fn get_gsp_info(&mut self) -> Result<()> {
+    pub(crate) fn get_gsp_info(&mut self) -> Result<GspInfo> {
         self.send(
             fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO,
             &EmptyCmd {
@@ -846,9 +855,13 @@ impl<'a> GspCmdq<'a> {
             .and_then(|bytes| CStr::from_bytes_with_nul(bytes).ok())
             .and_then(|cstr| cstr.to_str().ok())
             .unwrap_or("GPU Name: invalid utf8");
-        pr_info!("GPU Name: {}\n", gpu_name);
 
-        Ok(())
+        Ok(GspInfo {
+            h_internal_client: info.hInternalClient,
+            h_internal_device: info.hInternalDevice,
+            h_internal_subdevice: info.hInternalSubdevice,
+            gpu_name: CString::try_from_fmt(fmt!("{}", gpu_name))?,
+        })
     }
 }
 
