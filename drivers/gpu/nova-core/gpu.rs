@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use kernel::dma::CoherentAllocation;
-use kernel::{c_str, device, devres::Devres, error::code::*, pci, prelude::*, time::Delta};
+use kernel::{c_str, device, devres::Devres, error::code::*, pci, prelude::*, time::Delta, pr_info};
 
 use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
@@ -11,6 +11,7 @@ use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::{Firmware, FIRMWARE_VERSION};
 use crate::gfw;
 use crate::gsp;
+use crate::irq;
 use crate::nvfw::r570_144 as fw;
 use crate::regs;
 use crate::util;
@@ -182,7 +183,7 @@ pub(crate) struct Gpu {
     sysmem_flush: SysmemFlush,
     wpr_meta: CoherentAllocation<fw::GspFwWprMeta>,
     /// GSP information
-    gsp_info: gsp::GspInfo,
+    pub(crate) gsp_info: gsp::GspInfo,
 }
 
 #[pinned_drop]
@@ -399,6 +400,11 @@ impl Gpu {
         dev_info!(pdev.as_ref(), "GPU Name: {}\n", gsp_info.gpu_name.to_str().unwrap_or("invalid utf8"));
         dev_info!(pdev.as_ref(), "GSP Handles: Client={:#x}, Device={:#x}, Subdevice={:#x}\n", 
                   gsp_info.h_internal_client, gsp_info.h_internal_device, gsp_info.h_internal_subdevice);
+
+        // Call the dump function which properly passes parameters
+        if let Err(e) = irq::dump_table(&mut libos, &gsp_info) {
+            dev_err!(pdev.as_ref(), "Failed to test RM control: {:?}\n", e);
+        }
 
         // TODO: Figure out how to convince the compiler that the lifetime
         // parameter on GspSharedMemObjects is satisfied when we pass it to

@@ -12,7 +12,7 @@ use kernel::device;
 use kernel::devres::Devres;
 use kernel::dma::CoherentAllocation;
 use kernel::pci;
-use kernel::pr_info;
+use kernel::{pr_info, pr_err};
 use kernel::prelude::*;
 use kernel::str::{CStr, CString};
 use kernel::time::Delta;
@@ -29,6 +29,7 @@ use crate::regs::NV_PGSP_QUEUE_HEAD;
 use crate::util::wait_on_result;
 
 pub(crate) mod sequencer;
+pub(crate) mod rm_control;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
@@ -287,6 +288,10 @@ enum GspResponse {
     InitDone,
     StaticConfigInfo(#[allow(dead_code)] KBox<fw::GspStaticConfigInfo_t>),
     RunCpuSequencer(GspSequencerInfo),
+    RmControl {
+        status: u32,
+        data: KVec<u8>,
+    },
 }
 
 impl GspMessageElement for fw::GspStaticConfigInfo_t {}
@@ -773,6 +778,52 @@ impl<'a> GspCmdq<'a> {
                 pr_info!("Received RECOVERY_ACTION event\n");
                 Ok(GspResponse::Unsupported(rpc.function))
             }
+            fw::NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL => {
+                // Parse RM control response
+                // RmControlRpc header followed by response data
+
+
+                let rm_header_size = 24; // 6 u32 fields
+                if slice_1.len() < rm_header_size {
+                    pr_err!("RM Control response too small: {} bytes\n", slice_1.len());
+                    return Err(EINVAL);
+                }
+                
+                // Extract the status from the header (4th u32)
+                let status_offset = 12; // 3 * sizeof(u32)
+                let status = u32::from_ne_bytes(
+                    slice_1[status_offset..status_offset + 4]
+                        .try_into()
+                        .map_err(|_| EINVAL)?
+                );
+                
+                // Extract params_size from the header (5th u32)
+                let params_size_offset = 16; // 4 * sizeof(u32)
+                let params_size = u32::from_ne_bytes(
+                    slice_1[params_size_offset..params_size_offset + 4]
+                        .try_into()
+                        .map_err(|_| EINVAL)?
+                ) as usize;
+                
+                // Collect response data (after header)
+                let mut data = KVec::with_capacity(params_size, GFP_KERNEL)?;
+                
+                if slice_1.len() > rm_header_size {
+                    let data_in_slice1 = core::cmp::min(slice_1.len() - rm_header_size, params_size);
+                    data.extend_from_slice(&slice_1[rm_header_size..rm_header_size + data_in_slice1], GFP_KERNEL)?;
+                    
+                    if data_in_slice1 < params_size {
+                        if let Some(slice_2) = slice_2 {
+                            let remaining = params_size - data_in_slice1;
+                            let data_in_slice2 = core::cmp::min(slice_2.len(), remaining);
+                            data.extend_from_slice(&slice_2[..data_in_slice2], GFP_KERNEL)?;
+                        }
+                    }
+                }
+                
+                pr_info!("RM Control response: status={:#x}, data_len={}\n", status, data.len());
+                Ok(GspResponse::RmControl { status, data })
+            }
             _ => Err(ENOTSUPP),
         };
 
@@ -861,6 +912,16 @@ impl<'a> GspCmdq<'a> {
             h_internal_device: info.hInternalDevice,
             h_internal_subdevice: info.hInternalSubdevice,
             gpu_name: CString::try_from_fmt(fmt!("{}", gpu_name))?,
+        })
+    }
+
+    pub(crate) fn get_rm_control(&mut self, timeout: Delta) -> Result<(u32, KVec<u8>)> {
+        wait_on_result(timeout, || match self.receive() {
+            Ok(GspResponse::RmControl { status, data }) => Some(Ok((status, data))),
+            // We don't expect any other response at this stage.
+            Ok(_) => Some(Err(EINVAL)),
+            Err(EAGAIN) => None,
+            Err(e) => Some(Err(e)),
         })
     }
 }
