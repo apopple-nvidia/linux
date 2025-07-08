@@ -398,7 +398,12 @@ impl Gpu {
         // parameter on GspSharedMemObjects is satisfied when we pass it to
         // pin_init below. For now we just leak the memory, which is not good
         // but is better than a use-after-free.
-        core::mem::forget(libos);
+        //
+        // JOEL(7/8/2025): THIS IS BROKEN and make its impossible to pass along
+        // GspSharedMemObjects or libos and satisfy the borrow checker. Rust
+        // still has lifetime issues.
+        //
+        // core::mem::forget(libos);
 
         Ok(pin_init!(Self {
             spec,
