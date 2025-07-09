@@ -37,6 +37,7 @@ mod gsp;
 mod irq;
 mod nvfw;
 mod regs;
+mod sbuffer;
 mod util;
 mod vbios;
 
