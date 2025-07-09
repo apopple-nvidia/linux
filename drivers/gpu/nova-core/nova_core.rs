@@ -36,6 +36,7 @@ mod gpu;
 mod gsp;
 mod nvfw;
 mod regs;
+mod sbuffer;
 mod util;
 mod vbios;
 
