@@ -8,6 +8,7 @@ use crate::fb::FbLayout;
 use crate::fb::SysmemFlush;
 use crate::firmware::booter::{BooterFirmware, BooterKind};
 use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
+use crate::firmware::gsp::GspFirmware;
 use crate::firmware::{Firmware, FIRMWARE_VERSION};
 use crate::gfw;
 use crate::regs;
@@ -279,6 +280,11 @@ impl Gpu {
         let bar = self.bar.access(dev)?;
 
         let bios = Vbios::new(dev, bar)?;
+
+        let _gsp_fw = KBox::pin_init(
+            GspFirmware::new(dev, self.spec.chipset, FIRMWARE_VERSION)?,
+            GFP_KERNEL,
+        )?;
 
         let fb_layout = FbLayout::new(self.spec.chipset, bar)?;
         dev_dbg!(dev, "{:#x?}\n", fb_layout);
