@@ -186,6 +186,13 @@ impl Spec {
     }
 }
 
+/// Enum representing the different firmware architecture groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwareArchGroup {
+    TuringAmpereAda,
+    HopperBlackwellPlus,
+}
+
 /// Structure holding the resources required to operate the GPU.
 #[pin_data(PinnedDrop)]
 pub(crate) struct Gpu {
@@ -329,23 +336,90 @@ impl Gpu {
         }
     }
 
-    pub(crate) fn new(
+    /// Common helper to determine which firmware architecture group a chipset belongs to.
+    fn get_firmware_arch_group(arch: Architecture) -> FirmwareArchGroup {
+        match arch {
+            Architecture::Turing | Architecture::Ampere | Architecture::Ada => {
+                FirmwareArchGroup::TuringAmpereAda
+            }
+            Architecture::Blackwell => FirmwareArchGroup::HopperBlackwellPlus,
+            Architecture::Hopper => FirmwareArchGroup::HopperBlackwellPlus,
+        }
+    }
+
+    /// HAL function for architecture-specific initialization.
+    fn init_hal(
         pdev: &pci::Device<device::Bound>,
-        devres_bar: Devres<Bar0>,
-    ) -> Result<impl PinInit<Self>> {
+        devres_bar: &Devres<Bar0>,
+        spec: &Spec,
+    ) -> Result<(
+        Firmware,
+        SysmemFlush,
+        CoherentAllocation<fw::GspFwWprMeta>,
+        Falcon<Gsp>,
+        Falcon<Sec2>,
+    )> {
+        let arch_group = Self::get_firmware_arch_group(spec.chipset.arch());
+
+        match arch_group {
+            FirmwareArchGroup::TuringAmpereAda => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "Using Turing/Ampere/Ada firmware flow (complex)\n"
+                );
+                Self::turing_ampere_ada_init(pdev, devres_bar, spec)
+            }
+            FirmwareArchGroup::HopperBlackwellPlus => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "Using Blackwell+ firmware flow (simplified)\n"
+                );
+                Self::hopper_blackwell_plus_init(pdev, devres_bar, spec)
+            }
+        }
+    }
+
+    /// HAL function for architecture-specific SEC2 boot sequence.
+    fn sec2_boot_hal(
+        pdev: &pci::Device<device::Bound>,
+        bar: &Bar0,
+        spec: &Spec,
+        sec2_falcon: &Falcon<Sec2>,
+        fw: &Firmware,
+        wpr_handle: u64,
+    ) -> Result<()> {
+        let arch_group = Self::get_firmware_arch_group(spec.chipset.arch());
+
+        match arch_group {
+            FirmwareArchGroup::TuringAmpereAda => {
+                Self::turing_ampere_ada_sec2_boot(pdev, bar, sec2_falcon, fw, wpr_handle)
+            }
+            FirmwareArchGroup::HopperBlackwellPlus => {
+                // No SEC2 operations for Blackwell - FSP boots GSP directly
+                dev_info!(
+                    pdev.as_ref(),
+                    "Skipping SEC2 booter load for Blackwell architecture\n"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Architecture-specific initialization for Turing, Ampere, and Ada GPUs.
+    ///
+    /// Uses the complex firmware boot sequence with SEC2 falcon for booter load/unload operations.
+    fn turing_ampere_ada_init(
+        pdev: &pci::Device<device::Bound>,
+        devres_bar: &Devres<Bar0>,
+        spec: &Spec,
+    ) -> Result<(
+        Firmware,
+        SysmemFlush,
+        CoherentAllocation<fw::GspFwWprMeta>,
+        Falcon<Gsp>,
+        Falcon<Sec2>,
+    )> {
         let bar = devres_bar.access(pdev.as_ref())?;
-        let spec = Spec::new(bar)?;
-
-        dev_info!(
-            pdev.as_ref(),
-            "NVIDIA (Chipset: {}, Architecture: {:?}, Revision: {})\n",
-            spec.chipset,
-            spec.chipset.arch(),
-            spec.revision
-        );
-
-        pdev.as_ref().dma_set_mask((1 << 48) - 1)?;
-        pdev.as_ref().dma_set_coherent_mask((1 << 48) - 1)?;
 
         // We must wait for GFW_BOOT completion before doing any significant setup on the GPU.
         gfw::wait_gfw_boot_completion(bar)
@@ -378,29 +452,106 @@ impl Gpu {
 
         Self::run_fwsec_frts(pdev.as_ref(), &gsp_falcon, bar, &bios, &fb_layout)?;
 
+        let wpr_meta = gsp::build_wpr_meta(pdev.as_ref(), &fw, &fb_layout)?;
+
+        Ok((fw, sysmem_flush, wpr_meta, gsp_falcon, sec2_falcon))
+    }
+
+    /// Performs the SEC2 booter load sequence for Turing/Ampere/Ada architectures.
+    fn turing_ampere_ada_sec2_boot(
+        pdev: &pci::Device<device::Bound>,
+        bar: &Bar0,
+        sec2_falcon: &Falcon<Sec2>,
+        fw: &Firmware,
+        wpr_handle: u64,
+    ) -> Result<()> {
+        pr_info!("Trying to run Booter loader...\n");
+        sec2_falcon.reset(bar)?;
+        sec2_falcon.dma_load(bar, &fw.booter_load)?;
+        let (mbox0, mbox1) = sec2_falcon.boot(
+            bar,
+            Some(wpr_handle as u32),
+            Some((wpr_handle >> 32) as u32),
+        )?;
+        dev_info!(pdev.as_ref(), "SEC2 MBOX: {:#x},{:#x}\n", mbox0, mbox1);
+        Ok(())
+    }
+
+    /// Architecture-specific initialization for Hopper, Blackwell, and later GPUs.
+    ///
+    /// Uses the simplified firmware boot sequence: FMC → FSP → GSP directly.
+    /// NO SEC2 falcon usage - FSP boots GSP-RM directly using Chain of Trust.
+    fn hopper_blackwell_plus_init(
+        pdev: &pci::Device<device::Bound>,
+        _devres_bar: &Devres<Bar0>,
+        _spec: &Spec,
+    ) -> Result<(
+        Firmware,
+        SysmemFlush,
+        CoherentAllocation<fw::GspFwWprMeta>,
+        Falcon<Gsp>,
+        Falcon<Sec2>,
+    )> {
+        // TODO: Implement simplified Blackwell firmware boot sequence
+        // 1. Set up sysmem flush
+        // 2. Create GSP falcon (NO SEC2 falcon - Blackwell doesn't use SEC2)
+        // 3. Load FMC firmware and set up FSP boot parameters
+        // 4. Use FSP + Chain of Trust to launch GSP directly via nvkm_fsp_boot_gsp_fmc()
+        // 5. Wait for GSP lockdown release (not GFW_BOOT completion)
+        // 6. Continue with GSP initialization and debugfs
+        // 7. Run sequencer and wait for GSP init done
+        //
+        // NOTE: Unlike Turing/Ampere/Ada, Blackwell does NOT wait for GFW_BOOT completion
+        // The FSP handles secure boot directly and signals completion via lockdown release
+
+        // Reference Nouveau's gh100_gsp_init() and nvkm_fsp_boot_gsp_fmc()
+        // for the correct Blackwell boot sequence
+
+        dev_err!(
+            pdev.as_ref(),
+            "Hopper/Blackwell+ firmware init not yet implemented\n"
+        );
+        Err(ENOTSUPP)
+    }
+
+    pub(crate) fn new(
+        pdev: &pci::Device<device::Bound>,
+        devres_bar: Devres<Bar0>,
+    ) -> Result<impl PinInit<Self>> {
+        let bar = devres_bar.access(pdev.as_ref())?;
+        let spec = Spec::new(bar)?;
+
+        dev_info!(
+            pdev.as_ref(),
+            "NVIDIA (Chipset: {}, Architecture: {:?}, Revision: {})\n",
+            spec.chipset,
+            spec.chipset.arch(),
+            spec.revision
+        );
+
+        pdev.as_ref().dma_set_mask((1 << 48) - 1)?;
+        pdev.as_ref().dma_set_coherent_mask((1 << 48) - 1)?;
+
+        // Architecture-specific initialization via HAL
+        let (fw, sysmem_flush, wpr_meta, gsp_falcon, sec2_falcon) =
+            Self::init_hal(pdev, &devres_bar, &spec)?;
+
+        // Continue with the libos initialization and GSP boot sequence
         let mut libos = gsp::GspMemObjects::new(pdev, &devres_bar, &gsp_falcon, &sec2_falcon, &fw)?;
         let libos_handle = libos.libos.dma_handle();
-        let wpr_meta = gsp::build_wpr_meta(pdev.as_ref(), &fw, &fb_layout)?;
         let wpr_handle = wpr_meta.dma_handle();
 
+        // GSP falcon boot sequence
         gsp_falcon.reset(&bar)?;
         let (mbox0, mbox1) = gsp_falcon.boot(
             &bar,
             Some(libos_handle as u32),
             Some((libos_handle >> 32) as u32),
         )?;
-        dev_info!(pdev.as_ref(), "MBOX: {:#x},{:#x}\n", mbox0, mbox1,);
+        dev_info!(pdev.as_ref(), "GSP MBOX: {:#x},{:#x}\n", mbox0, mbox1);
 
-        pr_info!("Trying to run Booter loader...\n");
-
-        sec2_falcon.reset(&bar)?;
-        sec2_falcon.dma_load(&bar, &fw.booter_load)?;
-        let (mbox0, mbox1) = sec2_falcon.boot(
-            &bar,
-            Some(wpr_handle as u32),
-            Some((wpr_handle >> 32) as u32),
-        )?;
-        dev_info!(pdev.as_ref(), "MBOX: {:#x},{:#x}\n", mbox0, mbox1,);
+        // Architecture-specific SEC2 boot sequence via HAL
+        Self::sec2_boot_hal(pdev, &bar, &spec, &sec2_falcon, &fw, wpr_handle)?;
 
         // Match what Nouveau does here:
         gsp_falcon.write_os_version(&bar, fw.gsp_desc.app_version())?;
