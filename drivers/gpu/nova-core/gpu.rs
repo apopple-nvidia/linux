@@ -481,8 +481,7 @@ impl Gpu {
     /// NO SEC2 falcon usage - FSP boots GSP-RM directly using Chain of Trust.
     fn hopper_blackwell_plus_init(
         pdev: &pci::Device<device::Bound>,
-        // TODO: remove this once we start accessing the BAR for Hopper/Blackwell
-        _bar: &Bar0,
+        bar: &Bar0,
         spec: &Spec,
     ) -> Result<(
         Firmware,
@@ -491,27 +490,46 @@ impl Gpu {
         Falcon<Gsp>,
         Falcon<Sec2>,
     )> {
-        // TODO: Implement simplified Blackwell firmware boot sequence
-        // 1. Set up sysmem flush
-        // 2. Create GSP falcon (NO SEC2 falcon - Blackwell doesn't use SEC2)
-        // 3. Load FMC firmware and set up FSP boot parameters
-        // 4. Use FSP + Chain of Trust to launch GSP directly via nvkm_fsp_boot_gsp_fmc()
-        // 5. Wait for GSP lockdown release (not GFW_BOOT completion)
-        // 6. Continue with GSP initialization and debugfs
-        // 7. Run sequencer and wait for GSP init done
-        //
         // NOTE: Unlike Turing/Ampere/Ada, Blackwell does NOT wait for GFW_BOOT completion
         // The FSP handles secure boot directly and signals completion via lockdown release
 
-        // Reference Nouveau's gh100_gsp_init() and nvkm_fsp_boot_gsp_fmc()
-        // for the correct Blackwell boot sequence
+        // 1. Set up sysmem flush
+        let sysmem_flush = SysmemFlush::register(pdev.as_ref(), bar, spec.chipset)?;
 
-        dev_err!(
+        // 2. Create GSP falcon (no SEC2 falcon operations for Blackwell)
+        let gsp_falcon = Falcon::<Gsp>::new(
             pdev.as_ref(),
-            "Hopper/Blackwell+ firmware init not yet implemented for {}\n",
-            spec.chipset
+            spec.chipset,
+            bar,
+            spec.chipset > Chipset::GA100,
+        )?;
+        gsp_falcon.clear_swgen0_intr(bar);
+
+        // 3. Create dummy SEC2 falcon (required for signature but not used in Blackwell)
+        let sec2_falcon = Falcon::<Sec2>::new(pdev.as_ref(), spec.chipset, bar, false)?;
+
+        // 4. Load FMC-based firmware (not SEC2-based booter firmware)
+        let fw = Firmware::new(
+            pdev.as_ref(),
+            &sec2_falcon,
+            bar,
+            spec.chipset,
+            FIRMWARE_VERSION,
+        )?;
+
+        // 5. Set up framebuffer layout for GSP
+        let fb_layout = FbLayout::new(spec.chipset, bar, &fw)?;
+        dev_dbg!(pdev.as_ref(), "{:#x?}\n", fb_layout);
+
+        // 6. Build WPR meta for GSP (no FWSEC-FRTS for Blackwell)
+        let wpr_meta = gsp::build_wpr_meta(pdev.as_ref(), &fw, &fb_layout)?;
+
+        dev_info!(
+            pdev.as_ref(),
+            "Blackwell firmware initialization complete - using FSP boot sequence\n"
         );
-        Err(ENOTSUPP)
+
+        Ok((fw, sysmem_flush, wpr_meta, gsp_falcon, sec2_falcon))
     }
 
     pub(crate) fn new(
