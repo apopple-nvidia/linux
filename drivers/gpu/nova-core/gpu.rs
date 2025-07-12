@@ -350,7 +350,7 @@ impl Gpu {
     /// HAL function for architecture-specific initialization.
     fn init_hal(
         pdev: &pci::Device<device::Bound>,
-        devres_bar: &Devres<Bar0>,
+        bar: &Bar0,
         spec: &Spec,
     ) -> Result<(
         Firmware,
@@ -367,14 +367,14 @@ impl Gpu {
                     pdev.as_ref(),
                     "Using Turing/Ampere/Ada firmware flow (complex)\n"
                 );
-                Self::turing_ampere_ada_init(pdev, devres_bar, spec)
+                Self::turing_ampere_ada_init(pdev, bar, spec)
             }
             FirmwareArchGroup::HopperBlackwellPlus => {
                 dev_info!(
                     pdev.as_ref(),
                     "Using Blackwell+ firmware flow (simplified)\n"
                 );
-                Self::hopper_blackwell_plus_init(pdev, devres_bar, spec)
+                Self::hopper_blackwell_plus_init(pdev, bar, spec)
             }
         }
     }
@@ -410,7 +410,7 @@ impl Gpu {
     /// Uses the complex firmware boot sequence with SEC2 falcon for booter load/unload operations.
     fn turing_ampere_ada_init(
         pdev: &pci::Device<device::Bound>,
-        devres_bar: &Devres<Bar0>,
+        bar: &Bar0,
         spec: &Spec,
     ) -> Result<(
         Firmware,
@@ -419,8 +419,6 @@ impl Gpu {
         Falcon<Gsp>,
         Falcon<Sec2>,
     )> {
-        let bar = devres_bar.access(pdev.as_ref())?;
-
         // We must wait for GFW_BOOT completion before doing any significant setup on the GPU.
         gfw::wait_gfw_boot_completion(bar)
             .inspect_err(|_| dev_err!(pdev.as_ref(), "GFW boot did not complete"))?;
@@ -483,8 +481,9 @@ impl Gpu {
     /// NO SEC2 falcon usage - FSP boots GSP-RM directly using Chain of Trust.
     fn hopper_blackwell_plus_init(
         pdev: &pci::Device<device::Bound>,
-        _devres_bar: &Devres<Bar0>,
-        _spec: &Spec,
+        // TODO: remove this once we start accessing the BAR for Hopper/Blackwell
+        _bar: &Bar0,
+        spec: &Spec,
     ) -> Result<(
         Firmware,
         SysmemFlush,
@@ -509,7 +508,8 @@ impl Gpu {
 
         dev_err!(
             pdev.as_ref(),
-            "Hopper/Blackwell+ firmware init not yet implemented\n"
+            "Hopper/Blackwell+ firmware init not yet implemented for {}\n",
+            spec.chipset
         );
         Err(ENOTSUPP)
     }
@@ -534,7 +534,7 @@ impl Gpu {
 
         // Architecture-specific initialization via HAL
         let (fw, sysmem_flush, wpr_meta, gsp_falcon, sec2_falcon) =
-            Self::init_hal(pdev, &devres_bar, &spec)?;
+            Self::init_hal(pdev, bar, &spec)?;
 
         // Continue with the libos initialization and GSP boot sequence
         let mut libos = gsp::GspMemObjects::new(pdev, &devres_bar, &gsp_falcon, &sec2_falcon, &fw)?;
