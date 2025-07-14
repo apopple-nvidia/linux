@@ -25,6 +25,7 @@ use crate::fb::FbLayout;
 use crate::firmware::Firmware;
 use crate::nvfw::r570_144 as fw;
 use crate::regs::NV_PGSP_QUEUE_HEAD;
+use crate::sbuffer::{SBuffer, SBufferIteratorMut};
 use crate::util::wait_on_result;
 
 pub(crate) mod sequencer;
@@ -48,37 +49,13 @@ unsafe impl AsBytes for fw::GspSystemInfo {}
 // message which is only converted to bytes when actually doing the call. See the
 // registry for an example.
 pub(crate) trait GspMessageElement {
-    // Helper method to copy from a byte slice to ring buffer slices
-    fn copy_slice_to_ring_buffer(
-        &self,
-        cmd_slice: &[u8],
-        msg_slice_1: &mut [u8],
-        msg_slice_2: &mut Option<&mut [u8]>,
-    ) {
-        // Number of bytes of the command left to send
-        let mut bytes_remaining = cmd_slice.len();
-
-        let slice_len = min(msg_slice_1.len(), bytes_remaining);
-
-        // Copy the first bit of the command into the queue
-        msg_slice_1[0..slice_len].copy_from_slice(&cmd_slice[0..slice_len]);
-        bytes_remaining -= slice_len;
-
-        if let Some(some_msg_slice) = msg_slice_2 {
-            some_msg_slice[0..bytes_remaining].copy_from_slice(&cmd_slice[slice_len..]);
-        } else if bytes_remaining > 0 {
-            panic!("Impossible");
-        }
-    }
-
-    fn copy_to_slices(&self, msg_slice_1: &mut [u8], msg_slice_2: &mut Option<&mut [u8]>)
+    fn copy_to_sbuf(&self, sbuf: &mut SBufferIteratorMut<'_, '_>) -> Result
     where
         Self: Sized,
     {
         let cmd_slice =
             unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, self.size()) };
-
-        self.copy_slice_to_ring_buffer(cmd_slice, msg_slice_1, msg_slice_2);
+        sbuf.write_slice(cmd_slice)
     }
 
     // Creates a new struct by copying bytes from the given byte slice.
@@ -414,15 +391,18 @@ impl<'a> GspCmdq<'a> {
         used
     }
 
-    fn calculate_checksum(sum: u32, msg_bytes: &[u8]) -> u32 {
-        let mut sum64: u64 = sum as u64;
-        for &byte in msg_bytes.iter().rev() {
-            sum64 = sum64.rotate_left(8) ^ (byte as u64);
+    fn calculate_checksum(sbuf: &SBuffer<'_>) -> u32 {
+        let mut sum64: u64 = 0;
+        {
+            let mut iter = sbuf.iter().rev();
+            while let Some(byte) = iter.next() {
+                sum64 = sum64.rotate_left(8) ^ (byte as u64);
+            }
         }
         ((sum64 >> 32) as u32) ^ (sum64 as u32)
     }
 
-    fn alloc_cmd(self: &mut Self, cmd_size: usize) -> Result<(&mut [u8], Option<&mut [u8]>)> {
+    fn alloc_cmd_sbuffer<'b>(self: &mut Self, cmd_size: usize) -> Result<SBuffer<'b>> {
         let msg_size = cmd_size.div_ceil(GSP_PAGE_SIZE);
 
         while self.get_free_tx_pages() < msg_size as u32 {}
@@ -436,7 +416,7 @@ impl<'a> GspCmdq<'a> {
                 core::slice::from_raw_parts_mut(ptr as *mut u8, msg_size * GSP_PAGE_SIZE)
             };
 
-            return Ok((slice, None));
+            return Ok(SBuffer::<'b>::new([slice]));
         }
 
         // First slice contains the remaining free pages in the queue
@@ -451,7 +431,7 @@ impl<'a> GspCmdq<'a> {
                 (msg_size - 0x3f + wptr) * GSP_PAGE_SIZE,
             )
         };
-        return Ok((slice_1, Some(slice_2)));
+        return Ok(SBuffer::<'b>::new([slice_1, slice_2]));
     }
 
     pub(crate) fn send<A: GspMessageElement>(
@@ -481,7 +461,9 @@ impl<'a> GspCmdq<'a> {
         self.seq += 1;
         rpc.length = (size_of::<GspRpcHeader>() + cmd.size()) as u32;
 
-        let (msg_slice, mut some_msg_slice) = self.alloc_cmd(cmd.size() as usize)?;
+        let mut sbuf = self.alloc_cmd_sbuffer(
+            size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>() + cmd.size() as usize,
+        )?;
         let msg_header_slice = unsafe {
             core::slice::from_raw_parts(
                 &msg_header as *const GspMsgHeader as *const u8,
@@ -495,45 +477,20 @@ impl<'a> GspCmdq<'a> {
             )
         };
 
-        let mut index = 0;
-        msg_slice[index..index + msg_header_slice.len()].copy_from_slice(msg_header_slice);
-        index += msg_header_slice.len();
-        msg_slice[index..index + rpc_slice.len()].copy_from_slice(rpc_slice);
-        index += rpc_slice.len();
+        let mut sbuf_iter = sbuf.iter_mut();
+        sbuf_iter.write_slice(msg_header_slice)?;
+        sbuf_iter.write_slice(rpc_slice)?;
+        cmd.copy_to_sbuf(&mut sbuf_iter)?;
 
-        let mut msg_slice_len = cmd.size();
-        let mut msg_slice_2 = if let Some(slice) = &mut some_msg_slice {
-            // Implies the full command didn't fit without wrapping the
-            // circular buffer so we need to split it and the rest will be in
-            // some_msg_slice.
-            // TODO: Untested
-            let remaining = msg_slice_len - index;
-            msg_slice_len = msg_slice.len() - index;
-            Some(&mut slice[0..remaining])
-        } else {
-            None
-        };
-
-        cmd.copy_to_slices(
-            &mut msg_slice[index..index + msg_slice_len],
-            &mut msg_slice_2,
-        );
         msg_header.checksum = 0;
-        let mut total_size = msg_slice.len();
-        if let Some(some_slice) = msg_slice_2 {
-            total_size += some_slice.len();
-        }
+        let total_size = sbuf.capacity;
         msg_header.elem_count = total_size.div_ceil(GSP_PAGE_SIZE) as u32;
 
         // Calculate checksum over the entire message
-        msg_header.checksum = GspCmdq::calculate_checksum(msg_header.checksum, msg_slice);
+        msg_header.checksum = GspCmdq::calculate_checksum(&sbuf);
 
-        if let Some(some_slice) = some_msg_slice {
-            msg_header.checksum = GspCmdq::calculate_checksum(msg_header.checksum, some_slice);
-        }
-
-        // Need to copy it again now that the checksum has been updated
-        msg_slice[0..msg_header_slice.len()].copy_from_slice(msg_header_slice);
+        // Re-write the message header with the updated element count and checksum
+        sbuf.write(0, msg_header_slice)?;
 
         let mut wptr = self.cpu_wptr().unwrap() as u32;
         wptr += msg_header.elem_count as u32;
@@ -612,6 +569,7 @@ impl<'a> GspCmdq<'a> {
         let result = if rpc.function == function {
             Ok(A::new_from_slices(slice_1, slice_2)?)
         } else {
+            pr_info!("Got unexpected function {}\n", rpc.function);
             Err(ERANGE)
         };
 
@@ -710,11 +668,12 @@ impl GspMessageElement for EmptyCmd {
         self.size
     }
 
-    fn copy_to_slices(&self, msg_slice_1: &mut [u8], msg_slice_2: &mut Option<&mut [u8]>) {
-        msg_slice_1.fill(0);
-        if let Some(slice) = msg_slice_2 {
-            slice.fill(0);
+    fn copy_to_sbuf(&self, sbuf: &mut SBufferIteratorMut<'_, '_>) -> Result {
+        for i in 0..self.size() {
+            sbuf.write_byte(0)?;
         }
+
+        Ok(())
     }
 
     fn new_from_slices(slice_1: &[u8], slice_2: Option<&[u8]>) -> Result<Self> {
@@ -880,7 +839,7 @@ struct RegistryTable {
 }
 
 impl GspMessageElement for RegistryTable {
-    fn copy_to_slices(&self, msg_slice_1: &mut [u8], msg_slice_2: &mut Option<&mut [u8]>) {
+    fn copy_to_sbuf(&self, sbuf: &mut SBufferIteratorMut<'_, '_>) -> Result {
         let total_size = self.size();
         let align = core::mem::align_of::<fw::PACKED_REGISTRY_TABLE>();
         let layout = Layout::from_size_align(total_size, align)
@@ -926,16 +885,17 @@ impl GspMessageElement for RegistryTable {
             core::slice::from_raw_parts(ptr as *const u8, layout.size())
         };
 
-        // Use the common copying logic from the trait
-        self.copy_slice_to_ring_buffer(cmd_slice, msg_slice_1, msg_slice_2);
+        sbuf.write_slice(cmd_slice)?;
 
-        // Free the allocated memory by converting slice back to pointer
+        // Free the allocated memory by converting slice back to pointer.
         unsafe {
             use core::ptr::NonNull;
             let ptr = cmd_slice.as_ptr() as *mut u8;
             let ptr_nn = NonNull::new_unchecked(ptr);
             Kmalloc::free(ptr_nn, layout);
         }
+
+        Ok(())
     }
 
     fn size(&self) -> usize {
