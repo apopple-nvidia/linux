@@ -206,4 +206,33 @@ impl<'a> SBuffer<'a> {
         }
         Ok(())
     }
+
+    pub fn byte_iter(&'a mut self) -> SBufferByteIterator<'a> {
+        SBufferByteIterator { sbuf: self, pos: 0 }
+    }
+}
+
+struct SBufferByteIterator<'a> {
+    sbuf: &'a mut SBuffer<'a>,
+    pos: usize,
+}
+
+impl<'a> Iterator for SBufferByteIterator<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.sbuf.read_byte() {
+            Ok(byte) => Some(byte),
+            Err(_) => None,
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for SBufferByteIterator<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self.sbuf.read_byte() {
+            Ok(byte) => Some(byte),
+            Err(_) => None,
+        }
+    }
 }

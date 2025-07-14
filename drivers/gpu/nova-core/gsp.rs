@@ -26,6 +26,7 @@ use crate::fb::FbLayout;
 use crate::firmware::Firmware;
 use crate::nvfw::r570_144 as fw;
 use crate::regs::NV_PGSP_QUEUE_HEAD;
+use crate::sbuffer::SBuffer;
 use crate::util::wait_on_result;
 
 pub(crate) mod sequencer;
@@ -59,6 +60,15 @@ unsafe impl AsBytes for fw::GspSystemInfo {}
 // message which is only converted to bytes when actually doing the call. See the
 // registry for an example.
 pub(crate) trait GspMessageElement {
+    fn copy_to_sbuf(&self, sbuf: &mut SBuffer) -> Result
+    where
+        Self: Sized,
+    {
+        let cmd_slice =
+            unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, self.size()) };
+        sbuf.write_slice(cmd_slice)
+    }
+
     // Helper method to copy from a byte slice to ring buffer slices
     fn copy_slice_to_ring_buffer(
         &self,
@@ -448,6 +458,126 @@ impl<'a> GspCmdq<'a> {
             sum64 = sum64.rotate_left(8) ^ (byte as u64);
         }
         ((sum64 >> 32) as u32) ^ (sum64 as u32)
+    }
+
+    fn calculate_checksum_sbuffer<'b>(sbuf: &'b mut SBuffer<'b>) -> u32 {
+        let mut sum64: u64 = 0;
+        {
+            let mut iter = sbuf.byte_iter().rev();
+            while let Some(byte) = iter.next() {
+                sum64 = sum64.rotate_left(8) ^ (byte as u64);
+            }
+        } // iter goes out of scope here, releasing the borrow
+        ((sum64 >> 32) as u32) ^ (sum64 as u32)
+    }
+
+    fn alloc_cmd_sbuffer<'b>(self: &mut Self, cmd_size: usize) -> Result<SBuffer<'b>> {
+        let msg_size = cmd_size.div_ceil(GSP_PAGE_SIZE);
+
+        while self.get_free_tx_pages() < msg_size as u32 {}
+        let wptr = self.cpu_wptr().unwrap() as usize;
+        let mut ptr =
+            unsafe { core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).cpuq.msgq[wptr]) };
+
+        // Simple case where the queue doesn't wrap
+        if wptr + msg_size <= 0x3f {
+            let slice: &mut [u8] = unsafe {
+                core::slice::from_raw_parts_mut(ptr as *mut u8, msg_size * GSP_PAGE_SIZE)
+            };
+
+            return Ok(SBuffer::<'b>::new([&mut slice[0..cmd_size]]));
+        }
+
+        // First slice contains the remaining free pages in the queue
+        let slice_1: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(ptr as *mut u8, (0x3f - wptr) * GSP_PAGE_SIZE)
+        };
+        ptr = unsafe { core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).cpuq.msgq[0]) };
+        pr_info!("msg_size {} wptr {}\n", msg_size, wptr);
+        let slice_2: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(
+                ptr as *mut u8,
+                (msg_size - 0x3f + wptr) * GSP_PAGE_SIZE,
+            )
+        };
+        return Ok(SBuffer::<'b>::new([slice_1, slice_2]));
+    }
+
+    pub(crate) fn send_sbuffer<A: GspMessageElement>(
+        self: &mut Self,
+        function: u32,
+        cmd: &A,
+    ) -> Result<()> {
+        let mut msg_header = GspMsgHeader {
+            auth_tag_buffer: [0; 16],
+            aad_buffer: [0; 16],
+            checksum: 0,
+            sequence: self.seq,
+            elem_count: 1,
+            pad: 0,
+        };
+        let mut rpc = GspRpcHeader {
+            header_version: 0x03000000,
+            signature: 0x43505256,
+            length: 0,
+            function,
+            rpc_result: 0xffffffff,
+            rpc_result_private: 0xffffffff,
+            sequence: 0,
+            cpu_rm_gfid: 0,
+        };
+
+        self.seq += 1;
+        rpc.length = (size_of::<GspRpcHeader>() + cmd.size()) as u32;
+
+        let mut sbuf = self.alloc_cmd_sbuffer(
+            size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>() + cmd.size() as usize,
+        )?;
+        let msg_header_slice = unsafe {
+            core::slice::from_raw_parts(
+                &msg_header as *const GspMsgHeader as *const u8,
+                size_of::<GspMsgHeader>(),
+            )
+        };
+        let rpc_slice = unsafe {
+            core::slice::from_raw_parts(
+                &rpc as *const GspRpcHeader as *const u8,
+                size_of::<GspRpcHeader>(),
+            )
+        };
+        sbuf.write_slice(msg_header_slice)?;
+        sbuf.write_slice(rpc_slice)?;
+        cmd.copy_to_sbuf(&mut sbuf)?;
+
+        msg_header.checksum = 0;
+        let total_size = sbuf.total_capacity();
+        msg_header.elem_count = total_size.div_ceil(GSP_PAGE_SIZE) as u32;
+
+        // Calculate checksum over the entire message
+        sbuf.reset_pos();
+        msg_header.checksum = GspCmdq::calculate_checksum_sbuffer(&mut sbuf);
+        pr_info!("Checksum {}\n", msg_header.checksum);
+
+        // Re-write the message header with the updated element count and checksum
+        sbuf.reset_pos();
+        sbuf.write_slice(msg_header_slice);
+
+        let mut wptr = self.cpu_wptr().unwrap() as u32;
+        wptr += msg_header.elem_count as u32;
+        wptr %= 0x3f;
+
+        // TODO: Figure out Rust barriers
+        unsafe {
+            asm!("sfence";);
+            dma_write!(self.gsp_mem[0].cpuq.tx.write_ptr = wptr)?;
+            asm!("mfence";);
+        };
+
+        self.bar.try_access_with(|b| {
+            NV_PGSP_QUEUE_HEAD::default().set_address(0 as u32).write(b);
+        });
+
+        Ok(())
     }
 
     fn alloc_cmd(self: &mut Self, cmd_size: usize) -> Result<(&mut [u8], Option<&mut [u8]>)> {
@@ -886,7 +1016,7 @@ impl<'a> GspCmdq<'a> {
     }
 
     pub(crate) fn get_gsp_info(&mut self) -> Result<GspInfo> {
-        self.send(
+        self.send_sbuffer(
             fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO,
             &EmptyCmd {
                 size: size_of::<fw::GspStaticConfigInfo_t>(),
@@ -933,6 +1063,14 @@ struct EmptyCmd {
 impl GspMessageElement for EmptyCmd {
     fn size(&self) -> usize {
         self.size
+    }
+
+    fn copy_to_sbuf(&self, sbuf: &mut SBuffer) -> Result {
+        for i in 0..self.size() {
+            sbuf.write_byte(0)?;
+        }
+
+        Ok(())
     }
 
     fn copy_to_slices(&self, msg_slice_1: &mut [u8], msg_slice_2: &mut Option<&mut [u8]>) {
