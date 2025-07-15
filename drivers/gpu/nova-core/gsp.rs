@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use core::alloc::Layout;
-use core::cmp::min;
 use core::mem::MaybeUninit;
 
 use kernel::alloc::allocator::Kmalloc;
@@ -58,6 +57,19 @@ pub(crate) trait GspMessageElement {
         sbuf.write_slice(cmd_slice)
     }
 
+    fn new_from_sbuf(sbuf: &SBuffer<'_>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        return unsafe {
+            let mut result = MaybeUninit::<Self>::uninit();
+            let result_ptr = result.as_mut_ptr() as *mut u8;
+            let result_slice = core::slice::from_raw_parts_mut(result_ptr, size_of::<Self>());
+            sbuf.read(0, result_slice)?;
+            Ok(result.assume_init())
+        };
+    }
+
     // Creates a new struct by copying bytes from the given byte slice.
     // SAFETY: Assumes the given byte slice is a valid representation of self.
     fn new_from_slice(slice: &[u8]) -> Result<Self>
@@ -69,43 +81,6 @@ pub(crate) trait GspMessageElement {
         }
 
         Ok(unsafe { core::ptr::read(slice.as_ptr() as *const Self) })
-    }
-
-    // Creates a new struct by copying bytes from up to two discontiguous byte slices.
-    // SAFETY: Assumes the given byte slices are a valid representation of self.
-    fn new_from_slices(slice_1: &[u8], slice_2: Option<&[u8]>) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        if let Some(some_slice) = slice_2 {
-            if slice_1.len() + some_slice.len() < size_of::<Self>() {
-                return Err(EINVAL);
-            }
-
-            let mut result = MaybeUninit::<Self>::uninit();
-            let result_ptr = result.as_mut_ptr() as *mut u8;
-            let mut offset = 0;
-            let copy_len = min(slice_1.len(), size_of::<Self>());
-            unsafe {
-                core::ptr::copy_nonoverlapping(slice_1.as_ptr(), result_ptr, copy_len);
-            }
-            offset += copy_len;
-            if offset < size_of::<Self>() {
-                let remaining = size_of::<Self>() - offset;
-                let copy_len = min(some_slice.len(), remaining);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        some_slice.as_ptr(),
-                        result_ptr.add(offset),
-                        copy_len,
-                    );
-                }
-            }
-
-            Ok(unsafe { result.assume_init() })
-        } else {
-            Self::new_from_slice(slice_1)
-        }
     }
 
     fn size(&self) -> usize
@@ -122,34 +97,9 @@ pub(crate) struct GspSequencerInfo {
 }
 
 impl GspMessageElement for GspSequencerInfo {
-    fn new_from_slices(slice_1: &[u8], slice_2: Option<&[u8]>) -> Result<Self> {
-        // First, extract the info field from the beginning of the data
-        let info_size = size_of::<fw::rpc_run_cpu_sequencer_v17_00>();
-
-        // Check if we have enough data for the info field
-        let total_available = slice_1.len() + slice_2.map_or(0, |s| s.len());
-        if total_available < info_size {
-            return Err(EINVAL);
-        }
-
-        let info = fw::rpc_run_cpu_sequencer_v17_00::new_from_slices(slice_1, slice_2)?;
-
-        if slice_1.len() <= info_size {
-            return Err(EINVAL);
-        }
-
-        let mut data_len = slice_1.len() - info_size;
-        if let Some(slice) = slice_2 {
-            data_len += slice.len();
-        }
-
-        let mut cmd_data = KVec::with_capacity(data_len, GFP_KERNEL)?;
-        cmd_data.extend_from_slice(&slice_1[info_size..], GFP_KERNEL)?;
-
-        if let Some(slice) = slice_2 {
-            cmd_data.extend_from_slice(slice, GFP_KERNEL)?;
-        }
-
+    fn new_from_sbuf(sbuf: &SBuffer<'_>) -> Result<Self> {
+        let info = fw::rpc_run_cpu_sequencer_v17_00::new_from_sbuf(sbuf)?;
+        let cmd_data = sbuf.read_kvec(size_of::<fw::rpc_run_cpu_sequencer_v17_00>())?;
         Ok(GspSequencerInfo { info, cmd_data })
     }
 }
@@ -159,15 +109,9 @@ pub(crate) struct GspStaticConfigInfo {
 }
 
 impl GspMessageElement for GspStaticConfigInfo {
-    fn new_from_slices(slice_1: &[u8], slice_2: Option<&[u8]>) -> Result<Self> {
-        // We know the fw::GspStaticInfo_t is always less than GSP_PAGE_SIZE and
-        // therefore the buffer can't wrap. So we should never get a slice_2.
-        if let Some(slice) = slice_2 {
-            return Err(EINVAL);
-        }
-
+    fn new_from_sbuf(sbuf: &SBuffer<'_>) -> Result<Self> {
         let gpu_name_str = unsafe {
-            let static_info_ptr = slice_1.as_ptr() as *const fw::GspStaticConfigInfo_t;
+            let static_info_ptr = sbuf.as_ptr::<fw::GspStaticConfigInfo_t>(0)?;
             (*static_info_ptr)
                 .gpuNameString
                 .get(
@@ -531,7 +475,8 @@ impl<'a> GspCmdq<'a> {
         let ptr = unsafe {
             core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).gspq.msgq[rptr as usize])
         };
-        let msg_slice = unsafe { core::slice::from_raw_parts(ptr as *mut u8, remaining as usize) };
+        let msg_slice =
+            unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, remaining as usize) };
 
         // TODO: Validating the checksum will read this
         let _msg = GspMsgHeader::new_from_slice(&msg_slice[0..size_of::<GspMsgHeader>()])?;
@@ -549,25 +494,23 @@ impl<'a> GspCmdq<'a> {
             return Err(EAGAIN);
         }
 
-        let (slice_1, slice_2) = if rpc.length + header_size < remaining {
-            (
-                &msg_slice[(header_size as usize)..(header_size + rpc.length) as usize],
-                None,
-            )
+        let sbuf = if rpc.length + header_size < remaining {
+            SBuffer::new([
+                &mut msg_slice[(header_size as usize)..(header_size + rpc.length) as usize]
+            ])
         } else {
-            let slice_1 = &msg_slice[(header_size as usize)..(header_size + remaining) as usize];
+            let slice_1 =
+                &mut msg_slice[(header_size as usize)..(header_size + remaining) as usize];
             let ptr =
                 unsafe { core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).gspq.msgq[0]) };
-            (
-                slice_1,
-                Some(unsafe {
-                    core::slice::from_raw_parts(ptr as *mut u8, rpc.length as usize - slice_1.len())
-                }),
-            )
+            let slice_2 = unsafe {
+                core::slice::from_raw_parts_mut(ptr as *mut u8, rpc.length as usize - slice_1.len())
+            };
+            SBuffer::new([slice_1, slice_2])
         };
 
         let result = if rpc.function == function {
-            Ok(A::new_from_slices(slice_1, slice_2)?)
+            Ok(A::new_from_sbuf(&sbuf)?)
         } else {
             pr_info!("Got unexpected function {}\n", rpc.function);
             Err(ERANGE)
@@ -676,14 +619,10 @@ impl GspMessageElement for EmptyCmd {
         Ok(())
     }
 
-    fn new_from_slices(slice_1: &[u8], slice_2: Option<&[u8]>) -> Result<Self> {
-        let mut size = slice_1.len();
-
-        if let Some(some_slice) = slice_2 {
-            size += some_slice.len();
-        }
-
-        Ok(Self { size })
+    fn new_from_sbuf(sbuf: &SBuffer<'_>) -> Result<Self> {
+        Ok(Self {
+            size: sbuf.capacity,
+        })
     }
 }
 

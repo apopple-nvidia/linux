@@ -148,6 +148,18 @@ impl<'a> SBuffer<'a> {
         CString::try_from_fmt(fmt!("{}", string)).map_err(|_| ENOMEM)
     }
 
+    pub(crate) fn read_kvec(&self, mut offset: usize) -> Result<KVec<u8>> {
+        let mut data = KVec::with_capacity(self.capacity - offset, GFP_KERNEL)?;
+        for some_slice in &self.slices {
+            if let Some(slice) = some_slice {
+                data.extend_from_slice(&slice[offset..], GFP_KERNEL)?;
+                offset = 0;
+            }
+        }
+
+        Ok(data)
+    }
+
     fn get_pos_from_offset(&self, mut offset: usize) -> Result<(usize, usize)> {
         if offset >= self.capacity {
             return Err(ERANGE);
@@ -166,6 +178,20 @@ impl<'a> SBuffer<'a> {
         }
 
         Err(ERANGE)
+    }
+
+    // Get a raw pointer from the SBuffer to T. Will fail if the T is too large
+    // to fit within one slice or the slice is too small to contain T.
+    pub(crate) fn as_ptr<T>(&self, offset: usize) -> Result<*const T> {
+        let (idx, slice_offset) = self.get_pos_from_offset(offset)?;
+        let slice = self.slices[idx].as_ref().ok_or(ERANGE)?;
+
+        // The pointer must be contained within a single contiguous slice of memory
+        if size_of::<T>() > slice.len() - slice_offset {
+            return Err(ERANGE);
+        }
+
+        Ok(slice[slice_offset..].as_ptr() as *const T)
     }
 
     pub(crate) fn iter_mut<'b>(&'b mut self) -> SBufferIteratorMut<'a, 'b> {
