@@ -197,7 +197,7 @@ impl Gpu {
     /// Initialize debugfs for Nova GPU driver.
     ///
     /// Creates the debugfs directory and log files for GSP debugging.
-    fn init_debugfs(libos: &crate::gsp::GspMemObjects<'_>) {
+    fn init_debugfs(libos: &crate::gsp::GspMemObjects) {
         // debugfs files for GSP log
         unsafe {
             if (*core::ptr::addr_of!(NOVA_DEBUGFS)).is_none() {
