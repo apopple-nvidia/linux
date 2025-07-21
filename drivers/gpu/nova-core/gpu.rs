@@ -360,7 +360,9 @@ impl Gpu {
             gsp_falcon.is_riscv_active(&bar)?,
         );
 
-        libos.cmdq.run_sequencer(Delta::from_secs(10))?;
+        libos
+            .cmdq
+            .run_sequencer(bar, &gsp_falcon, &sec2_falcon, &fw, Delta::from_secs(10))?;
 
         Ok(pin_init!(Self {
             spec,
