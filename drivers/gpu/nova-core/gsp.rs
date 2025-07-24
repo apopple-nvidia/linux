@@ -32,6 +32,7 @@ pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
 pub(crate) const GSP_HEAP_SHIFT: u64 = 1 << 20;
 
+unsafe impl FromBytes for fw::rpc_run_cpu_sequencer_v17_00 {}
 unsafe impl FromBytes for fw::GSP_ARGUMENTS_CACHED {}
 unsafe impl AsBytes for fw::GSP_ARGUMENTS_CACHED {}
 unsafe impl AsBytes for fw::MESSAGE_QUEUE_INIT_ARGUMENTS {}
@@ -187,8 +188,6 @@ struct GspMem {
     cpuq: Msgq,
     gspq: Msgq,
 }
-
-impl GspMessageElement for fw::rpc_run_cpu_sequencer_v17_00 {}
 
 // Needed for CoherentAllocation
 unsafe impl FromBytes for GspMem {}
