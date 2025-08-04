@@ -10,6 +10,7 @@ use crate::fb::SysmemFlush;
 use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::{Firmware, FIRMWARE_VERSION};
 use crate::gfw;
+use crate::gsp::commands::{get_gsp_info, gsp_init_done, GspStaticConfigInfo};
 use crate::gsp::{self, GspMemObjects};
 use crate::nvfw::r570_144 as fw;
 use crate::regs;
@@ -205,7 +206,7 @@ pub(crate) struct Gpu {
     sysmem_flush: SysmemFlush,
     wpr_meta: CoherentAllocation<fw::GspFwWprMeta>,
     libos: GspMemObjects,
-    gsp_info: gsp::GspStaticConfigInfo,
+    gsp_info: GspStaticConfigInfo,
 }
 
 #[pinned_drop]
@@ -358,7 +359,7 @@ impl Gpu {
         SysmemFlush,
         CoherentAllocation<fw::GspFwWprMeta>,
         GspMemObjects,
-        gsp::GspStaticConfigInfo,
+        GspStaticConfigInfo,
     )> {
         let bar = devres_bar.access(pdev.as_ref())?;
 
@@ -458,11 +459,9 @@ impl Gpu {
             Delta::from_secs(10),
         )?;
 
-        libos
-            .cmdq
-            .gsp_init_done(pdev.as_ref(), Delta::from_secs(10))?;
+        gsp_init_done(&mut libos.cmdq, pdev.as_ref(), Delta::from_secs(10))?;
 
-        let gsp_info = libos.cmdq.get_gsp_info(pdev.as_ref(), bar)?;
+        let gsp_info = get_gsp_info(&mut libos.cmdq, pdev.as_ref(), bar)?;
 
         dev_info!(
             pdev.as_ref(),

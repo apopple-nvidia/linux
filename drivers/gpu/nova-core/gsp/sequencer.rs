@@ -11,9 +11,8 @@ use kernel::time::Delta;
 use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
 use crate::firmware::Firmware;
-use crate::gsp::GspMessageElement;
+use crate::gsp::cmdq::{GspCmdq, GspMessage};
 use crate::nvfw::r570_144 as fw;
-use crate::sbuffer::SBuffer;
 use crate::util::wait_on;
 
 use kernel::transmute::{FromBytes, FromBytesSized};
@@ -21,6 +20,9 @@ use kernel::{dev_dbg, dev_err};
 
 unsafe impl FromBytesSized for fw::GSP_SEQUENCER_BUFFER_CMD {}
 unsafe impl FromBytesSized for fw::rpc_run_cpu_sequencer_v17_00 {}
+impl GspMessage for fw::rpc_run_cpu_sequencer_v17_00 {
+    const FUNCTION: u32 = fw::NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER;
+}
 
 const CMD_SIZE: usize = size_of::<fw::GSP_SEQUENCER_BUFFER_CMD>();
 
@@ -28,14 +30,6 @@ pub(crate) struct GspSequencerInfo<'a> {
     pub info: &'a fw::rpc_run_cpu_sequencer_v17_00,
     pub cmd_data: KVec<u8>,
 }
-
-// impl GspMessageElement for GspSequencerInfo {
-//     fn new_from_sbuf<'a, I: Iterator<Item = &'a [u8]>>(sbuf: &mut SBuffer<I>) -> Result<Self> {
-//         let info = fw::rpc_run_cpu_sequencer_v17_00::new_from_sbuf(sbuf)?;
-//         let cmd_data = sbuf.read_into_kvec(GFP_KERNEL)?;
-//         Ok(GspSequencerInfo { info, cmd_data })
-//     }
-// }
 
 /// GSP Sequencer Command types with payload data
 /// Commands have an opcode and a opcode-dependent struct.
@@ -384,7 +378,7 @@ impl<'a, 'b> IntoIterator for &'b GspSequencer<'a> {
 
 impl<'a> GspSequencer<'a> {
     pub(crate) fn run(
-        cmdq: &mut crate::gsp::GspCmdq,
+        cmdq: &mut GspCmdq,
         fw: &'a Firmware,
         libos_dma_handle: u64,
         gsp_falcon: &'a Falcon<Gsp>,
@@ -393,13 +387,8 @@ impl<'a> GspSequencer<'a> {
         bar: &'a Bar0,
         timeout: Delta,
     ) -> Result {
-        let msg = loop {
-            match cmdq.receive_msg(dev) {
-                Ok(x) => break Ok(x),
-                Err(EAGAIN) => continue,
-                Err(x) => break Err(x),
-            };
-        }?;
+        cmdq.wait_msg_available(timeout)?;
+        let msg = cmdq.receive_msg(dev)?;
 
         let (info, mut sbuf) = msg.try_as::<fw::rpc_run_cpu_sequencer_v17_00>()?;
         let cmd_data = match sbuf {

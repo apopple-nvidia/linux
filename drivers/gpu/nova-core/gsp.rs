@@ -1,898 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use core::alloc::Layout;
-use core::mem::{offset_of, MaybeUninit};
-
-use kernel::alloc::allocator::Kmalloc;
 use kernel::alloc::flags::GFP_KERNEL;
-use kernel::alloc::kvec::KVec;
-use kernel::alloc::Allocator;
-use kernel::asm;
 use kernel::bindings;
 use kernel::device;
 use kernel::dma::CoherentAllocation;
+use kernel::dma_write;
 use kernel::pci;
-use kernel::pr_info;
 use kernel::prelude::*;
-use kernel::time::Delta;
-use kernel::transmute::{AsBytes, FromBytes, FromBytesSized};
-use kernel::{dma_read, dma_write};
+use kernel::transmute::{AsBytes, FromBytes};
 
 use crate::dma::DmaObject;
 use crate::driver::Bar0;
 use crate::fb::FbLayout;
 use crate::firmware::Firmware;
+use crate::gsp::cmdq::GspCmdq;
+use crate::gsp::commands::{build_registry, set_system_info};
 use crate::nvfw::r570_144 as fw;
-use crate::regs::NV_PGSP_QUEUE_HEAD;
-use crate::sbuffer::SBuffer;
-use crate::util::wait_on_result;
 
+pub(crate) mod cmdq;
+pub(crate) mod commands;
 pub(crate) mod sequencer;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
 pub(crate) const GSP_HEAP_SHIFT: u64 = 1 << 20;
 
-unsafe impl FromBytesSized for fw::GSP_ARGUMENTS_CACHED {}
-unsafe impl AsBytes for fw::GSP_ARGUMENTS_CACHED {}
-unsafe impl AsBytes for fw::MESSAGE_QUEUE_INIT_ARGUMENTS {}
-unsafe impl AsBytes for fw::GSP_SR_INIT_ARGUMENTS {}
-unsafe impl FromBytesSized for fw::GspFwWprMeta {}
-unsafe impl AsBytes for fw::GspFwWprMeta {}
-unsafe impl FromBytesSized for fw::GspSystemInfo {}
-unsafe impl AsBytes for fw::GspSystemInfo {}
-unsafe impl FromBytesSized for fw::GspStaticConfigInfo_t {}
-
-// We provide this trait because not all our structs are Sized so therefore the
-// AsBytes and FromBytes traits don't work. However we can provide default
-// implementations for all structs that are Sized, which we do here.
-//
-// This also allows us to create a convenient internal representation of a
-// message which is only converted to bytes when actually doing the call. See the
-// registry for an example.
-pub(crate) trait GspMessageElement: Sized {
-    fn new_from_sbuf<'a, I: Iterator<Item = &'a [u8]>>(sbuf: &mut SBuffer<I>) -> Result<Self>;
-}
-
-impl<T> GspMessageElement for T
-where
-    T: Sized + FromBytes,
-{
-    fn new_from_sbuf<'a, I: Iterator<Item = &'a [u8]>>(sbuf: &mut SBuffer<I>) -> Result<Self> {
-        return unsafe {
-            let mut result = MaybeUninit::<Self>::uninit();
-            let result_ptr = result.as_mut_ptr() as *mut u8;
-            let result_slice = core::slice::from_raw_parts_mut(result_ptr, size_of::<Self>());
-            sbuf.read_exact(result_slice)?;
-            Ok(result.assume_init())
-        };
-    }
-}
-
-pub(crate) trait GspCommandElement {
-    fn copy_to_sbuf<'a, I: Iterator<Item = &'a mut [u8]>>(&self, sbuf: &mut SBuffer<I>) -> Result;
-    fn size(&self) -> usize;
-}
-
-impl<T> GspCommandElement for T
-where
-    T: Sized + AsBytes,
-{
-    fn copy_to_sbuf<'a, I: Iterator<Item = &'a mut [u8]>>(&self, sbuf: &mut SBuffer<I>) -> Result {
-        sbuf.write_all(self.as_bytes())
-    }
-
-    fn size(&self) -> usize {
-        return size_of::<Self>();
-    }
-}
-
-pub(crate) trait GspCommand: GspCommandElement {
-    const FUNCTION: u32;
-}
-
-/// FB region information
-#[derive(Debug, Default, Copy, Clone)]
-pub(crate) struct FbRegion {
-    pub addr: u64,
-    pub size: u64,
-}
-
-pub(crate) trait GspMessage: Sized {
-    const FUNCTION: u32;
-}
-
-impl GspMessage for fw::rpc_run_cpu_sequencer_v17_00 {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER;
-}
-
-pub(crate) struct GspSequencerInfo<'a> {
-    info: &'a fw::rpc_run_cpu_sequencer_v17_00,
-    cmd_data: KVec<u8>,
-}
-
-// impl GspMessageElement for GspSequencerInfo {
-//     fn new_from_sbuf(sbuf: &SBuffer<'_>) -> Result<Self> {
-//         let info = fw::rpc_run_cpu_sequencer_v17_00::new_from_sbuf(sbuf)?;
-//         let cmd_data = sbuf.read_kvec(size_of::<fw::rpc_run_cpu_sequencer_v17_00>())?;
-//         Ok(GspSequencerInfo { info, cmd_data })
-//     }
-// }
-
-pub(crate) struct GspStaticConfigInfo {
-    pub gpu_name: [u8; 40],
-    pub h_internal_client: u32,
-    pub h_internal_device: u32,
-    pub h_internal_subdevice: u32,
-    pub fb_regions: KVec<FbRegion>,
-    pub fb_region_count: usize,
-    pub bar1_pdb: u64,
-    pub bar2_pdb: u64,
-}
-
-impl GspMessageElement for GspStaticConfigInfo {
-    fn new_from_sbuf<'a, I: Iterator<Item = &'a [u8]>>(sbuf: &mut SBuffer<I>) -> Result<Self> {
-        let static_info = fw::GspStaticConfigInfo_t::new_from_sbuf(sbuf)?;
-
-        let gpu_name_str = static_info
-            .gpuNameString
-            .get(
-                0..=static_info
-                    .gpuNameString
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(static_info.gpuNameString.len() - 1),
-            )
-            .and_then(|bytes| CStr::from_bytes_with_nul(bytes).ok())
-            .and_then(|cstr| cstr.to_str().ok())
-            .unwrap_or("invalid utf8");
-
-        let mut gpu_name = [0u8; 40];
-        let bytes = gpu_name_str.as_bytes();
-        let copy_len = core::cmp::min(bytes.len(), gpu_name.len());
-        gpu_name[..copy_len].copy_from_slice(&bytes[..copy_len]);
-        gpu_name[copy_len] = b'\0';
-
-        // Parse FB regions
-        let mut fb_regions = KVec::new();
-        let fb_info = &static_info.fbRegionInfoParams;
-
-        // TODO: Need to use dev_dbg
-        pr_info!("nova: Found {} FB regions\n", fb_info.numFBRegions);
-
-        for i in 0..fb_info.numFBRegions as usize {
-            if i >= 16 {
-                break;
-            } // Max regions in the array
-            let region = &fb_info.fbRegion[i];
-
-            // TODO: Need to use dev_dbg
-            pr_info!("nova: FB region {}: base={:#x} limit={:#x} reserved={:#x} compressed={} iso={} protected={}\n",
-                i, region.base, region.limit, region.reserved,
-                region.supportCompressed, region.supportISO, region.bProtected);
-
-            // Only add usable regions (not reserved, not protected, supports compression and ISO)
-            if region.reserved == 0 && region.bProtected == 0 {
-                if region.supportCompressed != 0 && region.supportISO != 0 {
-                    let size = (region.limit + 1) - region.base;
-                    fb_regions.push(
-                        FbRegion {
-                            addr: region.base,
-                            size,
-                        },
-                        GFP_KERNEL,
-                    )?;
-                }
-            }
-        }
-
-        let fb_region_count = fb_regions.len();
-
-        Ok(GspStaticConfigInfo {
-            gpu_name,
-            h_internal_client: static_info.hInternalClient,
-            h_internal_device: static_info.hInternalDevice,
-            h_internal_subdevice: static_info.hInternalSubdevice,
-            fb_regions,
-            fb_region_count,
-            bar1_pdb: static_info.bar1PdeBase,
-            bar2_pdb: static_info.bar2PdeBase,
-        })
-    }
-}
-
-// This next section contains constants and structures hand-coded from the GSP
-// headers We could replace these with bindgen versions, but that's a bit of a
-// pain because they basically end up pulling in the world (ie. definitions for
-// every rpc method). So for now the hand-coded ones are fine. They are just
-// structs so we can easily move to bindgen generated ones if/when we want to.
-
-// A GSP RPC header
-#[repr(C)]
-#[derive(Debug, Clone)]
-struct GspRpcHeader {
-    header_version: u32,
-    signature: u32,
-    length: u32,
-    function: u32,
-    rpc_result: u32,
-    rpc_result_private: u32,
-    sequence: u32,
-    cpu_rm_gfid: u32,
-}
-unsafe impl FromBytesSized for GspRpcHeader {}
-unsafe impl AsBytes for GspRpcHeader {}
-
-// A GSP message element header
-#[repr(C)]
-#[derive(Debug, Clone)]
-struct GspMsgHeader {
-    auth_tag_buffer: [u8; 16],
-    aad_buffer: [u8; 16],
-    checksum: u32,
-    sequence: u32,
-    elem_count: u32,
-    pad: u32,
-}
-unsafe impl FromBytesSized for GspMsgHeader {}
-unsafe impl AsBytes for GspMsgHeader {}
-
-// These next two structs come from msgq_priv.h. Hopefully the will never
-// need updating once the ABI is stabalised.
-#[repr(C)]
-#[derive(Debug)]
-struct MsgqTxHeader {
-    version: u32,    // queue version
-    size: u32,       // bytes, page aligned
-    msg_size: u32,   // entry size, bytes, must be power-of-2, 16 is minimum
-    msg_count: u32,  // number of entries in queue
-    write_ptr: u32,  // message id of next slot
-    flags: u32,      // if set it means "i want to swap RX"
-    rx_hdr_off: u32, // Offset of msgqRxHeader from start of backing store
-    entry_off: u32,  // Offset of entries from start of backing store
-}
-unsafe impl AsBytes for MsgqTxHeader {}
-
-#[repr(C)]
-#[derive(Debug)]
-struct MsgqRxHeader {
-    read_ptr: u32, // message id of last message read
-}
-
-/// Number of GSP pages making the Msgq.
-const MSGQ_NUM_PAGES: usize = 0x3f;
-
-#[repr(C, align(0x1000))]
-#[derive(Debug)]
-struct MsgqData {
-    data: [[u8; GSP_PAGE_SIZE]; MSGQ_NUM_PAGES],
-}
-
-// Annoyingly there is no real equivalent of #define so we're forced to use a
-// literal to specify the alignment above. So check that against the actual GSP
-// page size here.
-static_assert!(align_of::<MsgqData>() == GSP_PAGE_SIZE);
-
-// There is no struct defined for this in the open-gpu-kernel-source headers.
-// Instead it is defined by code in GspMsgQueuesInit().
-#[repr(C)]
-#[derive(Debug)]
-struct Msgq {
-    tx: MsgqTxHeader,
-    rx: MsgqRxHeader,
-    msgq: MsgqData,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct GspMem {
-    ptes: [u8; GSP_PAGE_SIZE],
-    cpuq: Msgq,
-    gspq: Msgq,
-}
-
-// Needed for CoherentAllocation
-unsafe impl FromBytesSized for GspMem {}
-unsafe impl AsBytes for GspMem {}
-
-// SAFETY: this hack isn't :-) Only required until Nova core can boot GSP.
-unsafe impl Send for GspCmdq {}
-
-pub(crate) struct GspCmdq {
-    msg_count: u32,
-    seq: u32,
-    gsp_mem: CoherentAllocation<GspMem>,
-    nr_ptes: u32,
-}
-
-struct GspQueueMessage<'a> {
-    cmdq: &'a mut GspCmdq,
-    slice_1: &'a [u8],
-    slice_2: Option<&'a [u8]>,
-    header: &'a GspRpcHeader,
-}
-
-impl<'a> GspQueueMessage<'a> {
-    fn try_as<M: GspMessage>(
-        &'a self,
-    ) -> Result<(&'a M, Option<SBuffer<core::array::IntoIter<&[u8], 2>>>)> {
-        let header_size = size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>();
-
-        if self.header.function != M::FUNCTION {
-            return Err(ERANGE);
-        }
-
-        let msg = unsafe { &*(self.slice_1.as_ptr() as *const M) };
-        let data = &self.slice_1[size_of::<M>()..];
-        let data_size = self.header.length as usize - size_of::<GspRpcHeader>() - size_of::<M>();
-
-        // let (slice_1, slice_2) = if data_size > 0 {
-        //     (Some(data), self.slice_2)
-        // } else {
-        //     (None, None)
-        // };
-
-        // Ok((msg, slice_1, slice_2))
-
-        let sbuf = if data_size > 0 {
-            Some(SBuffer::new_reader([data, self.slice_2.unwrap_or(&[])]))
-        } else {
-            None
-        };
-
-        Ok((msg, sbuf))
-    }
-
-    fn ack(self) -> Result {
-        self.cmdq.ack_msg(self.header.length)?;
-
-        Ok(())
-    }
-}
-
-impl GspCmdq {
-    // This is equivalent to gsp_shared_init()
-    fn new(dev: &device::Device<device::Bound>, _libos_dma_handle: u64) -> Result<GspCmdq> {
-        let mut gsp_mem =
-            CoherentAllocation::<GspMem>::alloc_coherent(dev, 1, GFP_KERNEL | __GFP_ZERO)?;
-
-        let nr_ptes = size_of::<GspMem>() >> GSP_PAGE_SHIFT;
-        build_assert!(nr_ptes * size_of::<u64>() <= GSP_PAGE_SIZE);
-
-        create_pte_array(&mut gsp_mem, 0);
-
-        const MSGQ_SIZE: u32 = size_of::<Msgq>() as u32;
-        const MSG_COUNT: u32 = ((MSGQ_SIZE as usize - GSP_PAGE_SIZE) / GSP_PAGE_SIZE) as u32;
-        const RX_HDR_OFF: u32 = offset_of!(Msgq, rx) as u32;
-        dma_write!(
-            gsp_mem[0].cpuq.tx = MsgqTxHeader {
-                version: 0,
-                size: MSGQ_SIZE,
-                entry_off: GSP_PAGE_SIZE as u32,
-                msg_size: GSP_PAGE_SIZE as u32,
-                msg_count: MSG_COUNT,
-                write_ptr: 0,
-                flags: 1,
-                rx_hdr_off: RX_HDR_OFF,
-            }
-        )?;
-
-        Ok(GspCmdq {
-            msg_count: MSG_COUNT,
-            seq: 0,
-            gsp_mem,
-            nr_ptes: nr_ptes as u32,
-        })
-    }
-
-    fn cpu_wptr(self: &Self) -> u32 {
-        // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-        // cannot fail.
-        unsafe { dma_read!(self.gsp_mem[0].cpuq.tx.write_ptr).unwrap_unchecked() }
-    }
-
-    fn gsp_rptr(self: &Self) -> u32 {
-        // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-        // cannot fail.
-        unsafe { dma_read!(self.gsp_mem[0].gspq.rx.read_ptr).unwrap_unchecked() }
-    }
-
-    fn cpu_rptr(self: &Self) -> u32 {
-        // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-        // cannot fail.
-        unsafe { dma_read!(self.gsp_mem[0].cpuq.rx.read_ptr).unwrap_unchecked() }
-    }
-
-    fn gsp_wptr(self: &Self) -> u32 {
-        // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-        // cannot fail.
-        unsafe { dma_read!(self.gsp_mem[0].gspq.tx.write_ptr).unwrap_unchecked() }
-    }
-
-    // Returns the numbers of pages free for sending an RPC to GSP.
-    fn free_tx_pages(self: &Self) -> u32 {
-        let wptr = self.cpu_wptr();
-        let rptr = self.gsp_rptr();
-        let mut free = rptr + self.msg_count - wptr - 1;
-
-        if free >= self.msg_count {
-            free -= self.msg_count;
-        }
-
-        free
-    }
-
-    // Returns the number of pages the GSP has written to the queue.
-    fn used_rx_pages(self: &Self) -> u32 {
-        let rptr = self.cpu_rptr();
-        let wptr = self.gsp_wptr();
-        let mut used = wptr + self.msg_count - rptr;
-        if used >= self.msg_count {
-            used -= self.msg_count;
-        }
-
-        used
-    }
-
-    fn calculate_checksum<T: Iterator<Item = u8>>(it: T) -> u32 {
-        let sum64 = it
-            .enumerate()
-            .map(|(idx, byte)| (((idx % 8) * 8) as u32, byte))
-            .fold(0, |acc, (rol, byte)| acc ^ (byte as u64).rotate_left(rol));
-
-        ((sum64 >> 32) as u32) ^ (sum64 as u32)
-    }
-
-    fn alloc_cmd_sbuffer(self: &mut Self, cmd_size: usize) -> Result<(&mut [u8], &mut [u8])> {
-        let msg_size = cmd_size.div_ceil(GSP_PAGE_SIZE);
-
-        while self.free_tx_pages() < msg_size as u32 {}
-        let wptr = self.cpu_wptr() as usize;
-        let ptr = unsafe {
-            core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).cpuq.msgq.data[wptr])
-        };
-
-        // Simple case where the queue doesn't wrap
-        if wptr + msg_size <= MSGQ_NUM_PAGES {
-            let slice: &mut [u8] = unsafe {
-                core::slice::from_raw_parts_mut(ptr as *mut u8, msg_size * GSP_PAGE_SIZE)
-            };
-
-            Ok((slice, &mut []))
-        } else {
-            // First slice contains the remaining free pages in the queue
-            let slice_1: &mut [u8] = unsafe {
-                core::slice::from_raw_parts_mut(
-                    ptr as *mut u8,
-                    (MSGQ_NUM_PAGES - wptr) * GSP_PAGE_SIZE,
-                )
-            };
-            let ptr = unsafe {
-                core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).cpuq.msgq.data[0])
-            };
-            pr_info!("msg_size {} wptr {}\n", msg_size, wptr);
-            let slice_2: &mut [u8] = unsafe {
-                core::slice::from_raw_parts_mut(
-                    ptr as *mut u8,
-                    (msg_size - MSGQ_NUM_PAGES + wptr) * GSP_PAGE_SIZE,
-                )
-            };
-            Ok((slice_1, slice_2))
-        }
-    }
-
-    pub(crate) fn send<A: GspCommand>(
-        &mut self,
-        dev: &device::Device<device::Bound>,
-        bar: &Bar0,
-        cmd: &A,
-    ) -> Result<()> {
-        let mut msg_header = GspMsgHeader {
-            auth_tag_buffer: [0; 16],
-            aad_buffer: [0; 16],
-            checksum: 0,
-            sequence: self.seq,
-            elem_count: 1,
-            pad: 0,
-        };
-        let rpc = GspRpcHeader {
-            header_version: 0x03000000,
-            signature: 0x43505256,
-            length: (size_of::<GspRpcHeader>() + cmd.size()) as u32,
-            function: A::FUNCTION,
-            rpc_result: 0xffffffff,
-            rpc_result_private: 0xffffffff,
-            sequence: 0,
-            cpu_rm_gfid: 0,
-        };
-
-        self.seq += 1;
-        let cmd_len = size_of::<GspMsgHeader>() + rpc.length as usize;
-
-        // Log RPC send with message type decoding
-        dev_dbg!(
-            dev,
-            "GSP RPC: send: Call {} - used_pages={}, function=0x{:x} ({}), header_size={}\n",
-            self.seq - 1,
-            cmd_len.div_ceil(GSP_PAGE_SIZE),
-            A::FUNCTION,
-            decode_gsp_function(A::FUNCTION),
-            size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()
-        );
-
-        // `alloc_cmd_sbuffer` returns the two slices we need, and we build a SRead/Write buffer
-        // from them.
-        let (slice1, slice2) = self.alloc_cmd_sbuffer(cmd_len)?;
-
-        let mut sbuf = SBuffer::new_writer([&mut slice1[..], &mut slice2[..]]);
-
-        sbuf.write_all(msg_header.as_bytes())?;
-        sbuf.write_all(rpc.as_bytes())?;
-        cmd.copy_to_sbuf(&mut sbuf)?;
-        drop(sbuf);
-
-        msg_header.checksum = 0;
-        msg_header.elem_count = cmd_len.div_ceil(GSP_PAGE_SIZE) as u32;
-
-        // Calculate checksum over the entire message
-        msg_header.checksum =
-            GspCmdq::calculate_checksum(SBuffer::new_reader([&slice1[..], &slice2[..]]));
-
-        // Re-write the message header with the updated element count and checksum
-        let mut sbuf = SBuffer::new_writer([slice1, slice2]);
-        sbuf.write_all(msg_header.as_bytes())?;
-        drop(sbuf);
-
-        let mut wptr = self.cpu_wptr() as u32;
-        wptr += msg_header.elem_count as u32;
-        wptr %= MSGQ_NUM_PAGES as u32;
-
-        // TODO: Figure out Rust barriers
-        unsafe {
-            asm!("sfence";);
-            // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-            // cannot fail.
-            dma_write!(self.gsp_mem[0].cpuq.tx.write_ptr = wptr).unwrap_unchecked();
-            asm!("mfence";);
-        };
-
-        NV_PGSP_QUEUE_HEAD::default()
-            .set_address(0 as u32)
-            .write(bar);
-
-        Ok(())
-    }
-
-    fn receive_msg<'a>(
-        self: &'a mut Self,
-        dev: &device::Device<device::Bound>,
-    ) -> Result<GspQueueMessage<'a>> {
-        const HEADER_SIZE: u32 = (size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()) as u32;
-
-        // Used pages contains the total number of pages available to consume
-        let used_pages = self.used_rx_pages();
-        if used_pages < HEADER_SIZE.div_ceil(GSP_PAGE_SIZE as u32) {
-            return Err(EAGAIN);
-        }
-
-        let rptr = self.cpu_rptr();
-
-        // Remaining number of bytes left before we have to wrap
-        let remaining = if rptr + used_pages > self.msg_count {
-            (self.msg_count - rptr) << GSP_PAGE_SHIFT
-        } else {
-            used_pages << GSP_PAGE_SHIFT
-        };
-
-        let ptr = unsafe {
-            core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).gspq.msgq.data[rptr as usize])
-        };
-        let msg_slice =
-            unsafe { core::slice::from_raw_parts(ptr as *const u8, remaining as usize) };
-        let rpc_ptr =
-            unsafe { &*((ptr as *const u8).add(size_of::<GspMsgHeader>()) as *const GspRpcHeader) };
-
-        // TODO: Validating the checksum will read this
-        let _msg = GspMsgHeader::from_bytes(&msg_slice[0..size_of::<GspMsgHeader>()])
-            .ok_or(EINVAL)?
-            .clone();
-        let rpc = GspRpcHeader::from_bytes(
-            &msg_slice
-                [size_of::<GspMsgHeader>()..size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()],
-        )
-        .ok_or(EINVAL)?
-        .clone();
-
-        // rpc.length includes the size of the GspRpcHeader. Remove it to make
-        // the rest of the code a bit easier to follow.
-        let rpc_length = rpc.length - size_of::<GspRpcHeader>() as u32;
-
-        // Log RPC receive with message type decoding
-        dev_dbg!(
-            dev,
-            "GSP RPC: receive: Call {} - used_pages={}, function=0x{:x} ({}), header_size={}\n",
-            rpc.sequence,
-            used_pages,
-            rpc.function,
-            decode_gsp_function(rpc.function),
-            HEADER_SIZE
-        );
-
-        // Not all pages of the message have made it to the queue so bail and let the caller retry.
-        if used_pages << GSP_PAGE_SHIFT < HEADER_SIZE + rpc_length {
-            return Err(EAGAIN);
-        }
-
-        let (slice_1, slice_2) = if rpc.length + HEADER_SIZE < remaining {
-            (
-                &msg_slice[(HEADER_SIZE as usize)..(HEADER_SIZE + rpc.length) as usize],
-                None,
-            )
-        } else {
-            let slice_1 = &msg_slice[(HEADER_SIZE as usize)..(HEADER_SIZE + remaining) as usize];
-            let ptr =
-                unsafe { core::ptr::addr_of!((*self.gsp_mem.start_ptr_mut()).gspq.msgq.data[0]) };
-            let slice_2 = unsafe {
-                core::slice::from_raw_parts(ptr as *const u8, rpc.length as usize - slice_1.len())
-            };
-            (slice_1, Some(slice_2))
-        };
-
-        let gspq_msg = GspQueueMessage {
-            cmdq: self,
-            slice_1,
-            slice_2,
-            header: rpc_ptr,
-        };
-
-        Ok(gspq_msg)
-    }
-
-    fn ack_msg(self: &mut Self, length: u32) -> Result {
-        const HEADER_SIZE: u32 = (size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()) as u32;
-        let mut rptr = self.cpu_rptr();
-        rptr = rptr + (HEADER_SIZE + length).div_ceil(GSP_PAGE_SIZE as u32);
-        rptr %= MSGQ_NUM_PAGES as u32;
-
-        // TODO: Figure out Rust barriers
-        unsafe {
-            asm!("mfence";);
-            // SAFETY: index `0` is valid as `gsp_mem` has been allocated accordingly, thus the access
-            // cannot fail.
-            dma_write!(self.gsp_mem[0].cpuq.rx.read_ptr = rptr).unwrap_unchecked();
-        };
-
-        Ok(())
-    }
-
-    pub(crate) fn gsp_init_done(
-        &mut self,
-        dev: &device::Device<device::Bound>,
-        timeout: Delta,
-    ) -> Result {
-        loop {
-            let msg = loop {
-                match self.receive_msg(dev) {
-                    Ok(x) => break Ok(x),
-                    Err(EAGAIN) => continue,
-                    Err(x) => break Err(x),
-                };
-            }?;
-
-            let init_done = msg.try_as::<GspInitDone>().map(|_| ());
-
-            msg.ack()?;
-
-            match init_done {
-                Ok(_) => break Ok(()),
-                Err(ERANGE) => continue,
-                Err(e) => break Err(e),
-            };
-        }
-    }
-
-    pub(crate) fn get_gsp_info(
-        &mut self,
-        dev: &device::Device<device::Bound>,
-        bar: &Bar0,
-    ) -> Result<GspStaticConfigInfo> {
-        self.send(
-            dev,
-            bar,
-            &GetGspStaticInfo(EmptyCmd {
-                size: size_of::<fw::GspStaticConfigInfo_t>(),
-            }),
-        )?;
-
-        // let x = wait_on_result(Delta::from_secs(5), &mut || match self.receive_msg(dev) {
-        //     Ok(x) => Some(Ok(&x)),
-        //     Err(EAGAIN) => None,
-        //     Err(e) => Some(Err(e)),
-        // });
-
-        let msg = loop {
-            match self.receive_msg(dev) {
-                Ok(x) => break Ok(x),
-                Err(EAGAIN) => continue,
-                Err(x) => break Err(x),
-            };
-        }?;
-
-        let info = msg.try_as::<fw::GspStaticConfigInfo_t>().map(|(x, _)| x)?;
-
-        let gpu_name_str = info
-            .gpuNameString
-            .get(
-                0..=info
-                    .gpuNameString
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(info.gpuNameString.len() - 1),
-            )
-            .and_then(|bytes| CStr::from_bytes_with_nul(bytes).ok())
-            .and_then(|cstr| cstr.to_str().ok())
-            .unwrap_or("invalid utf8");
-
-        let mut gpu_name = [0u8; 40];
-        let bytes = gpu_name_str.as_bytes();
-        let copy_len = core::cmp::min(bytes.len(), gpu_name.len());
-        gpu_name[..copy_len].copy_from_slice(&bytes[..copy_len]);
-        gpu_name[copy_len] = b'\0';
-
-        // Parse FB regions
-        let mut fb_regions = KVec::new();
-        let fb_info = &info.fbRegionInfoParams;
-
-        // TODO: Need to use dev_dbg
-        pr_info!("nova: Found {} FB regions\n", fb_info.numFBRegions);
-
-        for i in 0..fb_info.numFBRegions as usize {
-            if i >= 16 {
-                break;
-            } // Max regions in the array
-            let region = &fb_info.fbRegion[i];
-
-            // TODO: Need to use dev_dbg
-            pr_info!("nova: FB region {}: base={:#x} limit={:#x} reserved={:#x} compressed={} iso={} protected={}\n",
-                i, region.base, region.limit, region.reserved,
-                region.supportCompressed, region.supportISO, region.bProtected);
-
-            // Only add usable regions (not reserved, not protected, supports compression and ISO)
-            if region.reserved == 0 && region.bProtected == 0 {
-                if region.supportCompressed != 0 && region.supportISO != 0 {
-                    let size = (region.limit + 1) - region.base;
-                    fb_regions.push(
-                        FbRegion {
-                            addr: region.base,
-                            size,
-                        },
-                        GFP_KERNEL,
-                    )?;
-                }
-            }
-        }
-
-        let fb_region_count = fb_regions.len();
-        let config_info = GspStaticConfigInfo {
-            gpu_name,
-            h_internal_client: info.hInternalClient,
-            h_internal_device: info.hInternalDevice,
-            h_internal_subdevice: info.hInternalSubdevice,
-            fb_regions,
-            fb_region_count,
-            bar1_pdb: info.bar1PdeBase,
-            bar2_pdb: info.bar2PdeBase,
-        };
-
-        msg.ack()?;
-        Ok(config_info)
-    }
-}
-
-struct GspInitDone {}
-impl GspMessage for GspInitDone {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_EVENT_GSP_INIT_DONE;
-}
-
-impl GspMessage for fw::GspStaticConfigInfo_t {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO;
-}
-
-struct EmptyCmd {
-    size: usize,
-}
-
-impl GspMessageElement for EmptyCmd {
-    fn new_from_sbuf<'a, I: Iterator<Item = &'a [u8]>>(sbuf: &mut SBuffer<I>) -> Result<Self> {
-        Ok(Self { size: sbuf.count() })
-    }
-}
-
-impl GspCommandElement for EmptyCmd {
-    fn size(&self) -> usize {
-        self.size
-    }
-
-    fn copy_to_sbuf<'a, I: Iterator<Item = &'a mut [u8]>>(&self, sbuf: &mut SBuffer<I>) -> Result {
-        for _i in 0..self.size {
-            sbuf.write_all(&[0])?;
-        }
-
-        Ok(())
-    }
-}
-
-struct GetGspStaticInfo(EmptyCmd);
-impl GspCommandElement for GetGspStaticInfo {
-    fn copy_to_sbuf<'a, I: Iterator<Item = &'a mut [u8]>>(&self, sbuf: &mut SBuffer<I>) -> Result {
-        self.0.copy_to_sbuf(sbuf)
-    }
-
-    fn size(&self) -> usize {
-        self.0.size()
-    }
-}
-impl GspCommand for GetGspStaticInfo {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO;
-}
-
-pub(crate) fn build_wpr_meta(
-    dev: &device::Device<device::Bound>,
-    fw: &Firmware,
-    fb_layout: &FbLayout,
-) -> Result<CoherentAllocation<fw::GspFwWprMeta>> {
-    let wpr_meta =
-        CoherentAllocation::<fw::GspFwWprMeta>::alloc_coherent(dev, 1, GFP_KERNEL | __GFP_ZERO)?;
-    dma_write!(
-        wpr_meta[0] = fw::GspFwWprMeta {
-            magic: fw::GSP_FW_WPR_META_MAGIC as u64,
-            revision: fw::GSP_FW_WPR_META_REVISION as u64,
-            sysmemAddrOfRadix3Elf: fw.gsp.lvl0_dma_handle() as u64,
-            sizeOfRadix3Elf: fw.gsp.size() as u64,
-            sysmemAddrOfBootloader: fw.bootloader.ucode.dma_handle(),
-            sizeOfBootloader: fw.bootloader.ucode.size() as u64,
-            bootloaderCodeOffset: fw.bootloader.code_offset as u64,
-            bootloaderDataOffset: fw.bootloader.data_offset as u64,
-            bootloaderManifestOffset: fw.bootloader.manifest_offset as u64,
-            __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_1 {
-                __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_1__bindgen_ty_1 {
-                    sysmemAddrOfSignature: fw.gsp_sigs.dma_handle() as u64,
-                    sizeOfSignature: fw.gsp_sigs.size() as u64,
-                }
-            },
-            gspFwRsvdStart: fb_layout.heap.start,
-            nonWprHeapOffset: fb_layout.heap.start,
-            nonWprHeapSize: fb_layout.heap.end - fb_layout.heap.start,
-            gspFwWprStart: fb_layout.wpr2.start,
-            gspFwHeapOffset: fb_layout.wpr2_heap.start,
-            gspFwHeapSize: fb_layout.wpr2_heap.end - fb_layout.wpr2_heap.start,
-            gspFwOffset: fb_layout.elf.start,
-            bootBinOffset: fb_layout.boot.start,
-            frtsOffset: fb_layout.frts.start,
-            frtsSize: fb_layout.frts.end - fb_layout.frts.start,
-            gspFwWprEnd: fb_layout.vga_workspace.start & !(0x20000 - 1),
-            gspFwHeapVfPartitionCount: fb_layout.vf_partition_count,
-            fbSize: fb_layout.fb.end - fb_layout.fb.start,
-            vgaWorkspaceOffset: fb_layout.vga_workspace.start,
-            vgaWorkspaceSize: fb_layout.vga_workspace.end - fb_layout.vga_workspace.start,
-            bootCount: 0,
-            __bindgen_anon_2: fw::GspFwWprMeta__bindgen_ty_2 {
-                __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_2__bindgen_ty_1 {
-                    partitionRpcAddr: 0,
-                    partitionRpcRequestOffset: 0,
-                    partitionRpcReplyOffset: 0,
-                    ..Default::default()
-                },
-            },
-            verified: 0,
-            ..Default::default()
-        }
-    )?;
-
-    Ok(wpr_meta)
-}
-
-#[allow(unused)]
 pub(crate) struct GspMemObjects {
     libos: DmaObject,
     pub loginit: DmaObject,
@@ -961,137 +93,6 @@ fn create_dma_object(
     Ok(obj)
 }
 
-const GSP_REGISTRY_NUM_ENTRIES: usize = 2;
-struct RegistryEntry {
-    key: &'static str,
-    value: u32,
-}
-
-struct RegistryTable {
-    entries: [RegistryEntry; GSP_REGISTRY_NUM_ENTRIES],
-}
-
-impl GspCommandElement for RegistryTable {
-    fn copy_to_sbuf<'a, I: Iterator<Item = &'a mut [u8]>>(&self, sbuf: &mut SBuffer<I>) -> Result {
-        let total_size = self.size();
-        let align = core::mem::align_of::<fw::PACKED_REGISTRY_TABLE>();
-        let layout = Layout::from_size_align(total_size, align)
-            .map_err(|_| ENOMEM)
-            .unwrap();
-        let cmd_slice = unsafe {
-            // Use the kernel allocator which respects alignment
-            let allocation = Kmalloc::alloc(layout, GFP_KERNEL | __GFP_ZERO).unwrap();
-            let ptr = allocation.as_ptr() as *mut u8;
-
-            // Verify alignment (debug only)
-            debug_assert_eq!(ptr as usize % align, 0);
-
-            // Serialize the data into the allocated memory
-            let table = ptr as *mut fw::PACKED_REGISTRY_TABLE;
-            let mut table_data = ptr.add(
-                size_of::<fw::PACKED_REGISTRY_TABLE>()
-                    + GSP_REGISTRY_NUM_ENTRIES * size_of::<fw::PACKED_REGISTRY_ENTRY>(),
-            );
-
-            (*table).numEntries = GSP_REGISTRY_NUM_ENTRIES as u32;
-            (*table).size = total_size as u32;
-
-            for i in 0..GSP_REGISTRY_NUM_ENTRIES {
-                let entry_ptr = ptr.add(
-                    size_of::<fw::PACKED_REGISTRY_TABLE>()
-                        + i * size_of::<fw::PACKED_REGISTRY_ENTRY>(),
-                ) as *mut fw::PACKED_REGISTRY_ENTRY;
-
-                (*entry_ptr).nameOffset = table_data.offset_from(table as *const u8) as u32;
-                (*entry_ptr).type_ = fw::REGISTRY_TABLE_ENTRY_TYPE_DWORD as u8;
-                (*entry_ptr).data = self.entries[i].value;
-                (*entry_ptr).length = 0;
-
-                // Copy the key string to table_data and null terminate it
-                let key_bytes = self.entries[i].key.as_bytes();
-                core::ptr::copy_nonoverlapping(key_bytes.as_ptr(), table_data, key_bytes.len());
-                table_data = table_data.add(key_bytes.len());
-                *table_data = 0; // Add null terminator
-                table_data = table_data.add(1); // Move past null terminator
-            }
-
-            core::slice::from_raw_parts(ptr as *const u8, layout.size())
-        };
-
-        sbuf.write_all(cmd_slice)?;
-
-        // Free the allocated memory by converting slice back to pointer.
-        unsafe {
-            use core::ptr::NonNull;
-            let ptr = cmd_slice.as_ptr() as *mut u8;
-            let ptr_nn = NonNull::new_unchecked(ptr);
-            Kmalloc::free(ptr_nn, layout);
-        }
-
-        Ok(())
-    }
-
-    fn size(&self) -> usize {
-        let mut key_size = 0;
-        for i in 0..GSP_REGISTRY_NUM_ENTRIES {
-            key_size += self.entries[i].key.len() + 1; // +1 for NULL terminator
-        }
-        size_of::<fw::PACKED_REGISTRY_TABLE>()
-            + GSP_REGISTRY_NUM_ENTRIES * size_of::<fw::PACKED_REGISTRY_ENTRY>()
-            + key_size
-    }
-}
-
-impl GspCommand for RegistryTable {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_SET_REGISTRY;
-}
-
-fn build_registry(dev: &device::Device<device::Bound>, bar: &Bar0, cmdq: &mut GspCmdq) {
-    let registry = RegistryTable {
-        entries: [
-            RegistryEntry {
-                key: "RMSecBusResetEnable",
-                value: 1,
-            },
-            RegistryEntry {
-                key: "RMForcePcieConfigSave",
-                value: 1,
-            },
-        ],
-    };
-
-    cmdq.send(dev, bar, &registry).unwrap();
-}
-
-impl GspCommand for fw::GspSystemInfo {
-    const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO;
-}
-
-fn set_system_info(dev: &pci::Device<device::Bound>, bar: &Bar0, cmdq: &mut GspCmdq) -> Result {
-    let mut info = unsafe { MaybeUninit::<fw::GspSystemInfo>::zeroed().assume_init() };
-
-    info.gpuPhysAddr = dev.resource_start(0)?;
-    info.gpuPhysFbAddr = dev.resource_start(1)?;
-    info.gpuPhysInstAddr = dev.resource_start(3)?;
-    info.nvDomainBusDeviceFunc = dev.dev_id() as u64;
-
-    // Using TASK_SIZE in r535_gsp_rpc_set_system_info() seems wrong because
-    // TASK_SIZE is per-task. That's probably a design issue in GSP-RM though.
-    info.maxUserVa = (1 << 47) - 4096;
-    info.pciConfigMirrorBase = 0x088000;
-    info.pciConfigMirrorSize = 0x001000;
-
-    info.PCIDeviceID = ((dev.device_id() as u32) << 16) | dev.vendor_id() as u32;
-    info.PCISubDeviceID =
-        ((dev.subsystem_device_id() as u32) << 16) | dev.subsystem_vendor_id() as u32;
-    info.PCIRevisionID = dev.revision_id() as u32;
-    info.bIsPrimary = 0;
-    info.bPreserveVideoMemoryAllocations = 0;
-
-    cmdq.send(dev.as_ref(), bar, &info)?;
-    Ok(())
-}
-
 fn create_coherent_dma_object<A: AsBytes + FromBytes>(
     dev: &device::Device<device::Bound>,
     name: &'static str,
@@ -1121,6 +122,62 @@ fn create_coherent_dma_object<A: AsBytes + FromBytes>(
     Ok(obj)
 }
 
+pub(crate) fn build_wpr_meta(
+    dev: &device::Device<device::Bound>,
+    fw: &Firmware,
+    fb_layout: &FbLayout,
+) -> Result<CoherentAllocation<fw::GspFwWprMeta>> {
+    let wpr_meta =
+        CoherentAllocation::<fw::GspFwWprMeta>::alloc_coherent(dev, 1, GFP_KERNEL | __GFP_ZERO)?;
+    dma_write!(
+        wpr_meta[0] = fw::GspFwWprMeta {
+            magic: fw::GSP_FW_WPR_META_MAGIC as u64,
+            revision: fw::GSP_FW_WPR_META_REVISION as u64,
+            sysmemAddrOfRadix3Elf: fw.gsp.lvl0_dma_handle() as u64,
+            sizeOfRadix3Elf: fw.gsp.size() as u64,
+            sysmemAddrOfBootloader: fw.bootloader.ucode.dma_handle(),
+            sizeOfBootloader: fw.bootloader.ucode.size() as u64,
+            bootloaderCodeOffset: fw.bootloader.code_offset as u64,
+            bootloaderDataOffset: fw.bootloader.data_offset as u64,
+            bootloaderManifestOffset: fw.bootloader.manifest_offset as u64,
+            __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_1 {
+                __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_1__bindgen_ty_1 {
+                    sysmemAddrOfSignature: fw.gsp_sigs.dma_handle() as u64,
+                    sizeOfSignature: fw.gsp_sigs.size() as u64,
+                }
+            },
+            gspFwRsvdStart: fb_layout.heap.start,
+            nonWprHeapOffset: fb_layout.heap.start,
+            nonWprHeapSize: fb_layout.heap.end - fb_layout.heap.start,
+            gspFwWprStart: fb_layout.wpr2.start,
+            gspFwHeapOffset: fb_layout.wpr2_heap.start,
+            gspFwHeapSize: fb_layout.wpr2_heap.end - fb_layout.wpr2_heap.start,
+            gspFwOffset: fb_layout.elf.start,
+            bootBinOffset: fb_layout.boot.start,
+            frtsOffset: fb_layout.frts.start,
+            frtsSize: fb_layout.frts.end - fb_layout.frts.start,
+            gspFwWprEnd: fb_layout.vga_workspace.start & !(0x20000 - 1),
+            gspFwHeapVfPartitionCount: fb_layout.vf_partition_count,
+            fbSize: fb_layout.fb.end - fb_layout.fb.start,
+            vgaWorkspaceOffset: fb_layout.vga_workspace.start,
+            vgaWorkspaceSize: fb_layout.vga_workspace.end - fb_layout.vga_workspace.start,
+            bootCount: 0,
+            __bindgen_anon_2: fw::GspFwWprMeta__bindgen_ty_2 {
+                __bindgen_anon_1: fw::GspFwWprMeta__bindgen_ty_2__bindgen_ty_1 {
+                    partitionRpcAddr: 0,
+                    partitionRpcRequestOffset: 0,
+                    partitionRpcReplyOffset: 0,
+                    ..Default::default()
+                },
+            },
+            verified: 0,
+            ..Default::default()
+        }
+    )?;
+
+    Ok(wpr_meta)
+}
+
 impl GspMemObjects {
     pub(crate) fn new(pdev: &pci::Device<device::Bound>, bar: &Bar0) -> Result<Self> {
         let dev = pdev.as_ref();
@@ -1133,14 +190,14 @@ impl GspMemObjects {
         let mut cmdq = GspCmdq::new(dev, libos.dma_handle())?;
         let rmargs =
             create_coherent_dma_object::<fw::GSP_ARGUMENTS_CACHED>(dev, "RMARGS", &mut libos, 3)?;
+        let (shared_mem_phys_addr, cmd_queue_offset, stat_queue_offset) = cmdq.get_cmdq_offsets();
+
         dma_write!(
             rmargs[0].messageQueueInitArguments = fw::MESSAGE_QUEUE_INIT_ARGUMENTS {
-                sharedMemPhysAddr: cmdq.gsp_mem.dma_handle(),
+                sharedMemPhysAddr: shared_mem_phys_addr,
                 pageTableEntryCount: cmdq.nr_ptes,
-                cmdQueueOffset: core::mem::offset_of!(Msgq, msgq) as u64,
-                statQueueOffset: (core::mem::offset_of!(GspMem, gspq)
-                    - core::mem::offset_of!(GspMem, cpuq)
-                    + core::mem::offset_of!(Msgq, msgq)) as u64,
+                cmdQueueOffset: cmd_queue_offset,
+                statQueueOffset: stat_queue_offset,
             }
         )?;
         dma_write!(
@@ -1152,8 +209,8 @@ impl GspMemObjects {
         )?;
         dma_write!(rmargs[0].bDmemStack = 1)?;
 
-        set_system_info(pdev, bar, &mut cmdq)?;
-        build_registry(dev, bar, &mut cmdq);
+        set_system_info(&mut cmdq, pdev, bar)?;
+        build_registry(&mut cmdq, bar)?;
 
         Ok(GspMemObjects {
             libos,
@@ -1167,44 +224,5 @@ impl GspMemObjects {
 
     pub(crate) fn libos_dma_handle(&self) -> bindings::dma_addr_t {
         self.libos.dma_handle()
-    }
-}
-
-/// Decode GSP function code to human-readable message type name
-fn decode_gsp_function(function: u32) -> &'static str {
-    match function {
-        // Common function codes
-        fw::NV_VGPU_MSG_FUNCTION_NOP => "NOP",
-        fw::NV_VGPU_MSG_FUNCTION_SET_GUEST_SYSTEM_INFO => "SET_GUEST_SYSTEM_INFO",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_ROOT => "ALLOC_ROOT",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_DEVICE => "ALLOC_DEVICE",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_MEMORY => "ALLOC_MEMORY",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_CTX_DMA => "ALLOC_CTX_DMA",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_CHANNEL_DMA => "ALLOC_CHANNEL_DMA",
-        fw::NV_VGPU_MSG_FUNCTION_MAP_MEMORY => "MAP_MEMORY",
-        fw::NV_VGPU_MSG_FUNCTION_BIND_CTX_DMA => "BIND_CTX_DMA",
-        fw::NV_VGPU_MSG_FUNCTION_ALLOC_OBJECT => "ALLOC_OBJECT",
-        fw::NV_VGPU_MSG_FUNCTION_FREE => "FREE",
-        fw::NV_VGPU_MSG_FUNCTION_LOG => "LOG",
-        fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO => "GET_GSP_STATIC_INFO",
-        fw::NV_VGPU_MSG_FUNCTION_SET_REGISTRY => "SET_REGISTRY",
-        fw::NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO => "GSP_SET_SYSTEM_INFO",
-        fw::NV_VGPU_MSG_FUNCTION_GSP_INIT_POST_OBJGPU => "GSP_INIT_POST_OBJGPU",
-        fw::NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL => "GSP_RM_CONTROL",
-        fw::NV_VGPU_MSG_FUNCTION_GET_STATIC_INFO => "GET_STATIC_INFO",
-
-        // Event codes
-        fw::NV_VGPU_MSG_EVENT_GSP_INIT_DONE => "INIT_DONE",
-        fw::NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER => "RUN_CPU_SEQUENCER",
-        fw::NV_VGPU_MSG_EVENT_POST_EVENT => "POST_EVENT",
-        fw::NV_VGPU_MSG_EVENT_RC_TRIGGERED => "RC_TRIGGERED",
-        fw::NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED => "MMU_FAULT_QUEUED",
-        fw::NV_VGPU_MSG_EVENT_OS_ERROR_LOG => "OS_ERROR_LOG",
-        fw::NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD => "NOCAT",
-        fw::NV_VGPU_MSG_EVENT_GSP_LOCKDOWN_NOTICE => "LOCKDOWN_NOTICE",
-        fw::NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT => "LIBOS_PRINT",
-
-        // Default for unknown codes
-        _ => "UNKNOWN",
     }
 }
