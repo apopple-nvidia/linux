@@ -11,7 +11,7 @@ use kernel::time::Delta;
 use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
 use crate::firmware::Firmware;
-use crate::gsp::cmdq::{GspCmdq, GspMessage};
+use crate::gsp::cmdq::{GspCmdq, GspMessageFromGsp};
 use crate::nvfw::r570_144 as fw;
 use crate::util::wait_on;
 
@@ -20,7 +20,7 @@ use kernel::{dev_dbg, dev_err};
 
 unsafe impl FromBytesSized for fw::GSP_SEQUENCER_BUFFER_CMD {}
 unsafe impl FromBytesSized for fw::rpc_run_cpu_sequencer_v17_00 {}
-impl GspMessage for fw::rpc_run_cpu_sequencer_v17_00 {
+impl GspMessageFromGsp for fw::rpc_run_cpu_sequencer_v17_00 {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER;
 }
 
@@ -387,8 +387,8 @@ impl<'a> GspSequencer<'a> {
         bar: &'a Bar0,
         timeout: Delta,
     ) -> Result {
-        cmdq.wait_msg_available(timeout)?;
-        let msg = cmdq.receive_msg(dev)?;
+        cmdq.wait_for_msg_from_gsp(timeout)?;
+        let msg = cmdq.receive_msg_from_gsp()?;
 
         let (info, mut sbuf) = msg.try_as::<fw::rpc_run_cpu_sequencer_v17_00>()?;
         let cmd_data = match sbuf {

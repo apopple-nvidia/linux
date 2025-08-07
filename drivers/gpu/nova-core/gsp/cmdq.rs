@@ -9,6 +9,7 @@ use kernel::dma::CoherentAllocation;
 use kernel::prelude::*;
 use kernel::time::Delta;
 use kernel::transmute::{AsBytes, FromBytes, FromBytesSized};
+use kernel::types::ARef;
 use kernel::{dma_read, dma_write};
 
 use crate::driver::Bar0;
@@ -19,11 +20,13 @@ use crate::regs::NV_PGSP_QUEUE_HEAD;
 use crate::sbuffer::SBuffer;
 use crate::util::wait_on;
 
-pub(crate) trait GspCommand: Sized {
+const GSP_COMMAND_TIMEOUT: i64 = 5;
+
+pub(crate) trait GspCommandToGsp: Sized {
     const FUNCTION: u32;
 }
 
-pub(crate) trait GspMessage: Sized {
+pub(crate) trait GspMessageFromGsp: Sized {
     const FUNCTION: u32;
 }
 
@@ -125,6 +128,7 @@ unsafe impl AsBytes for GspMem {}
 unsafe impl Send for GspCmdq {}
 
 pub(crate) struct GspCmdq {
+    dev: ARef<device::Device>,
     msg_count: u32,
     seq: u32,
     gsp_mem: CoherentAllocation<GspMem>,
@@ -139,7 +143,7 @@ pub(crate) struct GspQueueMessage<'a> {
 }
 
 impl<'a> GspQueueMessage<'a> {
-    pub(crate) fn try_as<M: GspMessage>(
+    pub(crate) fn try_as<M: GspMessageFromGsp>(
         &'a self,
     ) -> Result<(&'a M, Option<SBuffer<core::array::IntoIter<&[u8], 2>>>)> {
         if self.rpc_header.function != M::FUNCTION {
@@ -177,7 +181,7 @@ pub(crate) struct GspQueueCommand<'a> {
 }
 
 impl<'a> GspQueueCommand<'a> {
-    pub(crate) fn try_as<'b, M: GspCommand>(
+    pub(crate) fn try_as<'b, M: GspCommandToGsp>(
         &'b mut self,
     ) -> (
         &'b mut M,
@@ -197,17 +201,18 @@ impl<'a> GspQueueCommand<'a> {
         (msg, sbuf)
     }
 
-    pub(crate) fn send(self, bar: &Bar0) -> Result {
-        GspCmdq::send_msg(self, bar)?;
+    pub(crate) fn send_to_gsp(self, bar: &Bar0) -> Result {
+        self.cmdq.wait_for_free_cmd_to_gsp(
+            Delta::from_secs(GSP_COMMAND_TIMEOUT),
+            self.rpc_header.length as usize + size_of::<GspMsgHeader>(),
+        )?;
+        GspCmdq::send_cmd_to_gsp(self, bar)?;
         Ok(())
     }
 }
 
 impl GspCmdq {
-    pub(crate) fn new(
-        dev: &device::Device<device::Bound>,
-        _libos_dma_handle: u64,
-    ) -> Result<GspCmdq> {
+    pub(crate) fn new(dev: &device::Device<device::Bound>) -> Result<GspCmdq> {
         let mut gsp_mem =
             CoherentAllocation::<GspMem>::alloc_coherent(dev, 1, GFP_KERNEL | __GFP_ZERO)?;
 
@@ -233,6 +238,7 @@ impl GspCmdq {
         )?;
 
         Ok(GspCmdq {
+            dev: dev.into(),
             msg_count: MSG_COUNT,
             seq: 0,
             gsp_mem,
@@ -298,15 +304,25 @@ impl GspCmdq {
         ((sum64 >> 32) as u32) ^ (sum64 as u32)
     }
 
+    pub(crate) fn wait_for_free_cmd_to_gsp(&self, timeout: Delta, size: usize) -> Result {
+        wait_on(timeout, || {
+            if self.free_tx_pages() < size.div_ceil(GSP_PAGE_SIZE) as u32 {
+                None
+            } else {
+                Some(())
+            }
+        })
+    }
+
     pub(crate) fn alloc_gsp_queue_command<'a>(
         &'a mut self,
-        cmd_len: usize,
+        cmd_size: usize,
     ) -> Result<GspQueueCommand<'a>> {
         const HEADER_SIZE: usize = size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>();
-        let cmd_size = size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>() + cmd_len;
-
-        let msg_size = cmd_size.div_ceil(GSP_PAGE_SIZE);
-        while self.free_tx_pages() < msg_size as u32 {}
+        let msg_size = size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>() + cmd_size;
+        if self.free_tx_pages() < msg_size.div_ceil(GSP_PAGE_SIZE) as u32 {
+            return Err(EAGAIN);
+        }
         let wptr = self.cpu_wptr() as usize;
         let ptr = unsafe {
             core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).cpuq.msgq.data[wptr])
@@ -320,7 +336,7 @@ impl GspCmdq {
         msg_header.aad_buffer = [0; 16];
         msg_header.checksum = 0;
         msg_header.sequence = self.seq;
-        msg_header.elem_count = (HEADER_SIZE + cmd_len).div_ceil(GSP_PAGE_SIZE) as u32;
+        msg_header.elem_count = (HEADER_SIZE + cmd_size).div_ceil(GSP_PAGE_SIZE) as u32;
         msg_header.pad = 0;
         self.seq += 1;
 
@@ -334,28 +350,44 @@ impl GspCmdq {
         let rpc_header = GspRpcHeader::from_mut_bytes(rpc_header_slice).ok_or(EINVAL)?;
         rpc_header.header_version = 0x03000000;
         rpc_header.signature = 0x43505256;
-        rpc_header.length = (size_of::<GspRpcHeader>() + cmd_len) as u32;
+        rpc_header.length = (size_of::<GspRpcHeader>() + cmd_size) as u32;
         rpc_header.rpc_result = 0xffffffff;
         rpc_header.rpc_result_private = 0xffffffff;
         rpc_header.sequence = 0;
         rpc_header.cpu_rm_gfid = 0;
 
-        let slice_1: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut((ptr as *mut u8).add(HEADER_SIZE), cmd_len) };
-        slice_1.fill(0);
+        // Number of bytes left before we have to wrap the buffer
+        let remaining = ((self.msg_count as usize - wptr) << GSP_PAGE_SHIFT) - HEADER_SIZE;
 
-        // TODO: Make slice_2
+        let (slice_1, slice_2) = if cmd_size <= remaining {
+            let slice_1: &mut [u8] = unsafe {
+                core::slice::from_raw_parts_mut((ptr as *mut u8).add(HEADER_SIZE), cmd_size)
+            };
+            slice_1.fill(0);
+            (slice_1, &mut [] as &mut [u8])
+        } else {
+            let slice_1: &mut [u8] = unsafe {
+                core::slice::from_raw_parts_mut((ptr as *mut u8).add(HEADER_SIZE), remaining)
+            };
+            let ptr = unsafe {
+                core::ptr::addr_of_mut!((*self.gsp_mem.start_ptr_mut()).gspq.msgq.data[0])
+            };
+            let slice_2: &mut [u8] =
+                unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, remaining - cmd_size) };
+            slice_1.fill(0);
+            (slice_1, slice_2)
+        };
 
         Ok(GspQueueCommand {
             cmdq: self,
             msg_header,
             rpc_header,
             slice_1,
-            slice_2: &mut [],
+            slice_2,
         })
     }
 
-    pub(crate) fn send_msg(cmd: GspQueueCommand<'_>, bar: &Bar0) -> Result {
+    pub(crate) fn send_cmd_to_gsp(cmd: GspQueueCommand<'_>, bar: &Bar0) -> Result {
         // Find the start of the message. We could also re-read the HW pointer.
         let slice_1: &[u8] = unsafe {
             core::slice::from_raw_parts(
@@ -363,6 +395,14 @@ impl GspCmdq {
                 size_of::<GspMsgHeader>() + cmd.rpc_header.length as usize,
             )
         };
+
+        dev_dbg!(
+            &cmd.cmdq.dev,
+            "GSP RPC: send: seq# {}, function=0x{:x} ({})\n",
+            cmd.cmdq.seq - 1,
+            cmd.rpc_header.function,
+            decode_gsp_function(cmd.rpc_header.function),
+        );
 
         // Calculate checksum over the entire message
         cmd.msg_header.checksum =
@@ -388,7 +428,7 @@ impl GspCmdq {
         Ok(())
     }
 
-    pub(crate) fn msg_available(self: &Self) -> bool {
+    pub(crate) fn msg_from_gsp_available(self: &Self) -> bool {
         const HEADER_SIZE: u32 = (size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()) as u32;
 
         // Used pages contains the total number of pages available to consume
@@ -414,23 +454,17 @@ impl GspCmdq {
         true
     }
 
-    pub(crate) fn wait_msg_available(self: &Self, timeout: Delta) -> Result {
-        wait_on(
-            timeout,
-            || {
-                if self.msg_available() {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-        )
+    pub(crate) fn wait_for_msg_from_gsp(self: &Self, timeout: Delta) -> Result {
+        wait_on(timeout, || {
+            if self.msg_from_gsp_available() {
+                Some(())
+            } else {
+                None
+            }
+        })
     }
 
-    pub(crate) fn receive_msg<'a>(
-        self: &'a mut Self,
-        dev: &device::Device<device::Bound>,
-    ) -> Result<GspQueueMessage<'a>> {
+    pub(crate) fn receive_msg_from_gsp<'a>(self: &'a mut Self) -> Result<GspQueueMessage<'a>> {
         const HEADER_SIZE: u32 = (size_of::<GspMsgHeader>() + size_of::<GspRpcHeader>()) as u32;
 
         // Used pages contains the total number of pages available to consume
@@ -454,8 +488,7 @@ impl GspCmdq {
         let msg_slice =
             unsafe { core::slice::from_raw_parts(ptr as *const u8, remaining as usize) };
 
-        // TODO: Validating the checksum will read this
-        let _msg =
+        let msg_header =
             GspMsgHeader::from_bytes(&msg_slice[0..size_of::<GspMsgHeader>()]).ok_or(EINVAL)?;
         let rpc_header = GspRpcHeader::from_bytes(
             &msg_slice
@@ -469,13 +502,11 @@ impl GspCmdq {
 
         // Log RPC receive with message type decoding
         dev_dbg!(
-            dev,
-            "GSP RPC: receive: Call {} - used_pages={}, function=0x{:x} ({}), header_size={}\n",
+            self.dev,
+            "GSP RPC: receive: seq# {}, function=0x{:x} ({})\n",
             rpc_header.sequence,
-            used_pages,
             rpc_header.function,
             decode_gsp_function(rpc_header.function),
-            HEADER_SIZE
         );
 
         // Should never happen if `wait_on_message()` has been called but we need to check.
@@ -500,6 +531,21 @@ impl GspCmdq {
             };
             (slice_1, Some(slice_2))
         };
+
+        if GspCmdq::calculate_checksum(SBuffer::new_reader([
+            &msg_header.as_bytes(),
+            &rpc_header.as_bytes(),
+            slice_1,
+            slice_2.unwrap_or(&[]),
+        ])) != 0
+        {
+            dev_err!(
+                self.dev,
+                "GSP RPC: receive: Call {} - bad checksum",
+                rpc_header.sequence
+            );
+            return Err(EIO);
+        }
 
         let gspq_msg = GspQueueMessage {
             cmdq: self,

@@ -12,7 +12,7 @@ use kernel::time::Delta;
 use kernel::transmute::{AsBytes, FromBytesSized};
 
 use crate::driver::Bar0;
-use crate::gsp::cmdq::{GspCmdq, GspCommand, GspMessage};
+use crate::gsp::cmdq::{GspCmdq, GspCommandToGsp, GspMessageFromGsp};
 use crate::gsp::GSP_PAGE_SIZE;
 use crate::nvfw::r570_144 as fw;
 use crate::sbuffer::SBuffer;
@@ -46,19 +46,15 @@ pub(crate) struct GspStaticConfigInfo {
 }
 
 struct GspInitDone {}
-impl GspMessage for GspInitDone {
+impl GspMessageFromGsp for GspInitDone {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_EVENT_GSP_INIT_DONE;
 }
 
-pub(crate) fn gsp_init_done(
-    cmdq: &mut GspCmdq,
-    dev: &device::Device<device::Bound>,
-    timeout: Delta,
-) -> Result {
+pub(crate) fn gsp_init_done(cmdq: &mut GspCmdq, timeout: Delta) -> Result {
     loop {
-        cmdq.wait_msg_available(timeout)?;
+        cmdq.wait_for_msg_from_gsp(timeout)?;
         let msg = loop {
-            match cmdq.receive_msg(dev) {
+            match cmdq.receive_msg_from_gsp() {
                 Ok(x) => break Ok(x),
                 Err(EAGAIN) => continue,
                 Err(x) => break Err(x),
@@ -77,24 +73,20 @@ pub(crate) fn gsp_init_done(
     }
 }
 
-impl GspMessage for fw::GspStaticConfigInfo_t {
+impl GspMessageFromGsp for fw::GspStaticConfigInfo_t {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO;
 }
 
-impl GspCommand for fw::GspStaticConfigInfo_t {
+impl GspCommandToGsp for fw::GspStaticConfigInfo_t {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO;
 }
 
-pub(crate) fn get_gsp_info(
-    cmdq: &mut GspCmdq,
-    dev: &device::Device<device::Bound>,
-    bar: &Bar0,
-) -> Result<GspStaticConfigInfo> {
+pub(crate) fn get_gsp_info(cmdq: &mut GspCmdq, bar: &Bar0) -> Result<GspStaticConfigInfo> {
     let mut msg = cmdq.alloc_gsp_queue_command(size_of::<fw::GspStaticConfigInfo_t>())?;
     msg.try_as::<fw::GspStaticConfigInfo_t>();
-    msg.send(bar)?;
-    cmdq.wait_msg_available(Delta::from_secs(5))?;
-    let msg = cmdq.receive_msg(dev)?;
+    msg.send_to_gsp(bar)?;
+    cmdq.wait_for_msg_from_gsp(Delta::from_secs(5))?;
+    let msg = cmdq.receive_msg_from_gsp()?;
     let info = msg.try_as::<fw::GspStaticConfigInfo_t>().map(|(x, _)| x)?;
 
     let gpu_name_str = info
@@ -176,7 +168,7 @@ struct RegistryTable {
 }
 
 struct GspRegistryTable;
-impl GspCommand for GspRegistryTable {
+impl GspCommandToGsp for GspRegistryTable {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_SET_REGISTRY;
 }
 
@@ -270,12 +262,12 @@ pub(crate) fn build_registry(cmdq: &mut GspCmdq, bar: &Bar0) -> Result {
         let sbuf = some_sbuf.ok_or(ENOMEM)?;
         registry.copy_to_sbuf_iter(sbuf)?;
     }
-    msg.send(bar)?;
+    msg.send_to_gsp(bar)?;
 
     Ok(())
 }
 
-impl GspCommand for fw::GspSystemInfo {
+impl GspCommandToGsp for fw::GspSystemInfo {
     const FUNCTION: u32 = fw::NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO;
 }
 
@@ -307,6 +299,6 @@ pub(crate) fn set_system_info(
         info.bIsPrimary = 0;
         info.bPreserveVideoMemoryAllocations = 0;
     }
-    msg.send(bar)?;
+    msg.send_to_gsp(bar)?;
     Ok(())
 }

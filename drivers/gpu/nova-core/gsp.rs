@@ -187,7 +187,7 @@ impl GspMemObjects {
         let logrm = create_dma_object(dev, "LOGRM", 0x10000, &mut libos, 2)?;
 
         // Creates its own PTE array
-        let mut cmdq = GspCmdq::new(dev, libos.dma_handle())?;
+        let mut cmdq = GspCmdq::new(dev)?;
         let rmargs =
             create_coherent_dma_object::<fw::GSP_ARGUMENTS_CACHED>(dev, "RMARGS", &mut libos, 3)?;
         let (shared_mem_phys_addr, cmd_queue_offset, stat_queue_offset) = cmdq.get_cmdq_offsets();
