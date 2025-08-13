@@ -17,8 +17,9 @@ use crate::gsp::cmdq::GspCmdq;
 use crate::nvfw::{
     GspFwWprMeta, GspFwWprMetaBootInfo, GspFwWprMetaBootResumeInfo, LibosMemoryRegionInitArgument,
     LibosMemoryRegionKind_LIBOS_MEMORY_REGION_CONTIGUOUS,
-    LibosMemoryRegionLoc_LIBOS_MEMORY_REGION_LOC_SYSMEM, GSP_FW_WPR_META_MAGIC,
-    GSP_FW_WPR_META_REVISION,
+    LibosMemoryRegionLoc_LIBOS_MEMORY_REGION_LOC_SYSMEM, GSP_ARGUMENTS_CACHED,
+    GSP_FW_WPR_META_MAGIC, GSP_FW_WPR_META_REVISION, GSP_SR_INIT_ARGUMENTS,
+    MESSAGE_QUEUE_INIT_ARGUMENTS,
 };
 
 pub(crate) mod cmdq;
@@ -41,6 +42,19 @@ unsafe impl AsBytes for GspFwWprMeta {}
 // are valid.
 unsafe impl FromBytes for GspFwWprMeta {}
 
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for GSP_ARGUMENTS_CACHED {}
+
+// SAFETY: This struct only contains integer types for which all bit patterns
+// are valid.
+unsafe impl FromBytes for GSP_ARGUMENTS_CACHED {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for MESSAGE_QUEUE_INIT_ARGUMENTS {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for GSP_SR_INIT_ARGUMENTS {}
+
 #[allow(unused)]
 pub(crate) struct GspMemObjects {
     libos: CoherentAllocation<LibosMemoryRegionInitArgument>,
@@ -49,6 +63,7 @@ pub(crate) struct GspMemObjects {
     pub logrm: CoherentAllocation<u8>,
     pub wpr_meta: CoherentAllocation<GspFwWprMeta>,
     pub cmdq: GspCmdq,
+    rmargs: CoherentAllocation<GSP_ARGUMENTS_CACHED>,
 }
 
 pub(crate) fn build_wpr_meta(
@@ -179,13 +194,36 @@ impl GspMemObjects {
         let wpr_meta = build_wpr_meta(dev, fw, fb_layout)?;
 
         // Creates its own PTE array
-        let cmdq = GspCmdq::new(dev)?;
+        let mut cmdq = GspCmdq::new(dev)?;
+        let rmargs =
+            create_coherent_dma_object::<GSP_ARGUMENTS_CACHED>(dev, "RMARGS", 1, &mut libos, 3)?;
+        let (shared_mem_phys_addr, cmd_queue_offset, stat_queue_offset) = cmdq.get_cmdq_offsets();
+
+        dma_write!(
+            rmargs[0].messageQueueInitArguments = MESSAGE_QUEUE_INIT_ARGUMENTS {
+                sharedMemPhysAddr: shared_mem_phys_addr,
+                pageTableEntryCount: cmdq.nr_ptes,
+                cmdQueueOffset: cmd_queue_offset,
+                statQueueOffset: stat_queue_offset,
+                ..Default::default()
+            }
+        )?;
+        dma_write!(
+            rmargs[0].srInitArguments = GSP_SR_INIT_ARGUMENTS {
+                oldLevel: 0,
+                flags: 0,
+                bInPMTransition: 0,
+                ..Default::default()
+            }
+        )?;
+        dma_write!(rmargs[0].bDmemStack = 1)?;
 
         Ok(GspMemObjects {
             libos,
             loginit,
             logintr,
             logrm,
+            rmargs,
             wpr_meta,
             cmdq,
         })
