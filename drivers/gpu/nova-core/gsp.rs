@@ -11,9 +11,11 @@ use kernel::ptr::{Alignable, Alignment};
 use kernel::sizes::SZ_128K;
 use kernel::transmute::{AsBytes, FromBytes};
 
+use crate::driver::Bar0;
 use crate::fb::FbLayout;
 use crate::firmware::Firmware;
 use crate::gsp::cmdq::GspCmdq;
+use crate::gsp::commands::{build_registry, set_system_info};
 use crate::nvfw::{
     GspFwWprMeta, GspFwWprMetaBootInfo, GspFwWprMetaBootResumeInfo, LibosMemoryRegionInitArgument,
     LibosMemoryRegionKind_LIBOS_MEMORY_REGION_CONTIGUOUS,
@@ -23,6 +25,7 @@ use crate::nvfw::{
 };
 
 pub(crate) mod cmdq;
+pub(crate) mod commands;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
@@ -176,6 +179,7 @@ fn create_coherent_dma_object<A: AsBytes + FromBytes>(
 impl GspMemObjects {
     pub(crate) fn new(
         pdev: &pci::Device<device::Bound>,
+        bar: &Bar0,
         fw: &Firmware,
         fb_layout: &FbLayout,
     ) -> Result<Self> {
@@ -217,6 +221,9 @@ impl GspMemObjects {
             }
         )?;
         dma_write!(rmargs[0].bDmemStack = 1)?;
+
+        set_system_info(&mut cmdq, pdev, bar)?;
+        build_registry(&mut cmdq, bar)?;
 
         Ok(GspMemObjects {
             libos,

@@ -42,6 +42,9 @@ pub(crate) use r570_144::GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB;
 pub(crate) use r570_144::GspFwWprMeta;
 
 pub(crate) use r570_144::{
+    // Core GSP structures
+    GspSystemInfo,
+
     // LibOS memory structures
     LibosMemoryRegionInitArgument,
     LibosMemoryRegionKind_LIBOS_MEMORY_REGION_CONTIGUOUS,
@@ -87,6 +90,11 @@ pub(crate) use r570_144::{
     NV_VGPU_MSG_FUNCTION_NOP,
     NV_VGPU_MSG_FUNCTION_SET_GUEST_SYSTEM_INFO,
     NV_VGPU_MSG_FUNCTION_SET_REGISTRY,
+
+    // RM registry structures
+    PACKED_REGISTRY_ENTRY,
+    PACKED_REGISTRY_TABLE,
+    REGISTRY_TABLE_ENTRY_TYPE_DWORD,
 };
 
 pub(crate) type GspFwWprMetaBootResumeInfo = r570_144::GspFwWprMeta__bindgen_ty_1;
