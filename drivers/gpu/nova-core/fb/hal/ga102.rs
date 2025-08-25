@@ -4,10 +4,16 @@ use kernel::prelude::*;
 
 use crate::driver::Bar0;
 use crate::fb::hal::FbHal;
+use crate::nvfw;
+use crate::nvfw::LibosParams;
 use crate::regs;
 
 fn vidmem_size_ga102(bar: &Bar0) -> u64 {
     regs::NV_USABLE_FB_SIZE_IN_MB::read(bar).usable_fb_size()
+}
+
+fn libos_params_ga102() -> &'static LibosParams {
+    &nvfw::LIBOS3_PARAMS
 }
 
 struct Ga102;
@@ -29,6 +35,10 @@ impl FbHal for Ga102 {
 
     fn vidmem_size(&self, bar: &Bar0) -> u64 {
         vidmem_size_ga102(bar)
+    }
+
+    fn libos_params(&self) -> &'static LibosParams {
+        libos_params_ga102()
     }
 }
 

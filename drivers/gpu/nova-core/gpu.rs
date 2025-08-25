@@ -280,12 +280,12 @@ impl Gpu {
 
         let bios = Vbios::new(dev, bar)?;
 
-        let _gsp_fw = KBox::pin_init(
+        let gsp_fw = KBox::pin_init(
             GspFirmware::new(dev, self.spec.chipset, FIRMWARE_VERSION)?,
             GFP_KERNEL,
         )?;
 
-        let fb_layout = FbLayout::new(self.spec.chipset, bar)?;
+        let fb_layout = FbLayout::new(self.spec.chipset, bar, &gsp_fw)?;
         dev_dbg!(dev, "{:#x?}\n", fb_layout);
 
         self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;

@@ -2,7 +2,10 @@
 
 use crate::driver::Bar0;
 use crate::fb::hal::FbHal;
+use crate::nvfw;
+use crate::nvfw::LibosParams;
 use crate::regs;
+
 use kernel::prelude::*;
 
 /// Shift applied to the sysmem address before it is written into `NV_PFB_NISO_FLUSH_SYSMEM_ADDR`,
@@ -34,6 +37,10 @@ pub(super) fn vidmem_size_gp102(bar: &Bar0) -> u64 {
     regs::NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE::read(bar).usable_fb_size()
 }
 
+pub(super) fn libos_params_tu102() -> &'static LibosParams {
+    &nvfw::LIBOS2_PARAMS
+}
+
 struct Tu102;
 
 impl FbHal for Tu102 {
@@ -51,6 +58,10 @@ impl FbHal for Tu102 {
 
     fn vidmem_size(&self, bar: &Bar0) -> u64 {
         vidmem_size_gp102(bar)
+    }
+
+    fn libos_params(&self) -> &'static LibosParams {
+        libos_params_tu102()
     }
 }
 

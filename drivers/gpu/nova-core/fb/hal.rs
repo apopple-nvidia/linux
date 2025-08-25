@@ -4,6 +4,7 @@ use kernel::prelude::*;
 
 use crate::driver::Bar0;
 use crate::gpu::Chipset;
+use crate::nvfw::LibosParams;
 
 mod ga100;
 mod ga102;
@@ -23,6 +24,9 @@ pub(crate) trait FbHal {
 
     /// Returns the VRAM size, in bytes.
     fn vidmem_size(&self, bar: &Bar0) -> u64;
+
+    /// Returns the libos requirements to start the GSP firmware.
+    fn libos_params(&self) -> &'static LibosParams;
 }
 
 /// Returns the HAL corresponding to `chipset`.
