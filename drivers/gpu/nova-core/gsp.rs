@@ -106,7 +106,6 @@ impl GspMemObjects {
         })
     }
 
-    #[expect(unused)]
     pub(crate) fn libos_dma_handle(&self) -> bindings::dma_addr_t {
         self.libos.dma_handle()
     }

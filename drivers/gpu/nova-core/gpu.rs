@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use kernel::{device, devres::Devres, error::code::*, pci, prelude::*, sync::Arc};
+use kernel::{device, devres::Devres, error::code::*, pci, prelude::*, sync::Arc, time::Delta};
 
 use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
@@ -14,6 +14,7 @@ use crate::gfw;
 use crate::gsp::{self, GspMemObjects};
 use crate::nvfw::GspFwWprMeta;
 use crate::regs;
+use crate::util;
 use crate::vbios::Vbios;
 
 use core::fmt;
@@ -294,8 +295,22 @@ impl Gpu {
         self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;
 
         let libos = gsp::GspMemObjects::new(pdev, bar)?;
+        let libos_handle = libos.libos_dma_handle();
 
-        let _booter_loader = BooterFirmware::new(
+        self.gsp_falcon.reset(bar)?;
+        let (mbox0, mbox1) = self.gsp_falcon.boot(
+            bar,
+            Some(libos_handle as u32),
+            Some((libos_handle >> 32) as u32),
+        )?;
+        dev_dbg!(dev, "GSP MBOX0: {:#x}, MBOX1: {:#x}\n", mbox0, mbox1);
+
+        dev_dbg!(
+            dev,
+            "Using SEC2 to load and run the booter_load firmware...\n"
+        );
+
+        let booter_loader = BooterFirmware::new(
             dev,
             BooterKind::Loader,
             self.spec.chipset,
@@ -304,7 +319,36 @@ impl Gpu {
             bar,
         )?;
 
-        let _wpr_meta = GspFwWprMeta::new(dev, &gsp_fw, &fb_layout)?;
+        let wpr_meta = GspFwWprMeta::new(dev, &gsp_fw, &fb_layout)?;
+        let wpr_handle = wpr_meta.dma_handle();
+
+        self.sec2_falcon.reset(bar)?;
+        self.sec2_falcon.dma_load(bar, &booter_loader)?;
+        let (mbox0, mbox1) = self.sec2_falcon.boot(
+            bar,
+            Some(wpr_handle as u32),
+            Some((wpr_handle >> 32) as u32),
+        )?;
+        dev_dbg!(dev, "SEC2 MBOX0: {:#x}, MBOX1{:#x}\n", mbox0, mbox1);
+
+        // Match what Nouveau does here:
+        self.gsp_falcon
+            .write_os_version(bar, gsp_fw.bootloader.app_version)?;
+
+        // Poll for RISC-V to become active before running sequencer
+        util::wait_on(Delta::from_secs(5), || {
+            if self.gsp_falcon.is_riscv_active(bar).unwrap_or(false) {
+                Some(())
+            } else {
+                None
+            }
+        })?;
+
+        dev_dbg!(
+            dev,
+            "RISC-V active? {}\n",
+            self.gsp_falcon.is_riscv_active(bar)?,
+        );
 
         Ok(libos)
     }
