@@ -97,6 +97,12 @@ impl LibosParams {
 }
 
 pub(crate) use r570_144::{
+    GSP_ARGUMENTS_CACHED,
+    GSP_SR_INIT_ARGUMENTS,
+
+    // RM message queue parameters
+    MESSAGE_QUEUE_INIT_ARGUMENTS,
+
     // GSP events
     NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
     NV_VGPU_MSG_EVENT_GSP_LOCKDOWN_NOTICE,
