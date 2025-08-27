@@ -293,7 +293,7 @@ impl Gpu {
 
         self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;
 
-        let libos = gsp::GspMemObjects::new(pdev)?;
+        let libos = gsp::GspMemObjects::new(pdev, bar)?;
 
         let _booter_loader = BooterFirmware::new(
             dev,

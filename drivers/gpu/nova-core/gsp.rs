@@ -10,11 +10,14 @@ use kernel::prelude::*;
 use kernel::ptr::Alignment;
 use kernel::transmute::{AsBytes, FromBytes};
 
+use crate::driver::Bar0;
 use crate::gsp::cmdq::GspCmdq;
+use crate::gsp::commands::{build_registry, set_system_info};
 use crate::nvfw::GspArgumentsCached;
 use crate::nvfw::LibosMemoryRegionInitArgument;
 
 pub(crate) mod cmdq;
+pub(crate) mod commands;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
@@ -69,7 +72,7 @@ fn create_coherent_dma_object<A: AsBytes + FromBytes>(
 }
 
 impl GspMemObjects {
-    pub(crate) fn new(pdev: &pci::Device<device::Bound>) -> Result<Self> {
+    pub(crate) fn new(pdev: &pci::Device<device::Bound>, bar: &Bar0) -> Result<Self> {
         let dev = pdev.as_ref();
         let mut libos = CoherentAllocation::<LibosMemoryRegionInitArgument>::alloc_coherent(
             dev,
@@ -89,6 +92,9 @@ impl GspMemObjects {
             create_coherent_dma_object::<GspArgumentsCached>(dev, "RMARGS", 1, &mut libos, 3)?;
 
         dma_write!(rmargs[0] = GspArgumentsCached::new(&cmdq))?;
+
+        set_system_info(&mut cmdq, pdev, bar)?;
+        build_registry(&mut cmdq, bar)?;
 
         Ok(GspMemObjects {
             libos,
