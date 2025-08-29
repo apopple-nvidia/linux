@@ -11,7 +11,7 @@ use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::gsp::GspFirmware;
 use crate::firmware::FIRMWARE_VERSION;
 use crate::gfw;
-use crate::gsp::commands::gsp_init_done;
+use crate::gsp::commands::{get_gsp_info, gsp_init_done};
 use crate::gsp::{self, GspMemObjects};
 use crate::nvfw::GspFwWprMeta;
 use crate::regs;
@@ -366,6 +366,12 @@ impl Gpu {
         )?;
 
         gsp_init_done(&mut libos.cmdq, Delta::from_secs(10))?;
+        let info = get_gsp_info(&mut libos.cmdq, bar)?;
+        dev_info!(
+            pdev.as_ref(),
+            "GPU name: {}\n",
+            util::str_from_null_terminated(&info.gpu_name)
+        );
 
         Ok(libos)
     }
