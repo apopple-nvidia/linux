@@ -11,29 +11,14 @@ use kernel::ptr::Alignment;
 use kernel::transmute::{AsBytes, FromBytes};
 
 use crate::gsp::cmdq::GspCmdq;
-use crate::nvfw::{
-    LibosMemoryRegionInitArgument, GSP_ARGUMENTS_CACHED, GSP_SR_INIT_ARGUMENTS,
-    MESSAGE_QUEUE_INIT_ARGUMENTS,
-};
+use crate::nvfw::GspArgumentsCached;
+use crate::nvfw::LibosMemoryRegionInitArgument;
 
 pub(crate) mod cmdq;
 
 pub(crate) const GSP_PAGE_SHIFT: usize = 12;
 pub(crate) const GSP_PAGE_SIZE: usize = 1 << GSP_PAGE_SHIFT;
 pub(crate) const GSP_HEAP_ALIGNMENT: Alignment = Alignment::new(1 << 20);
-
-// SAFETY: Padding is explicit and will not contain uninitialized data.
-unsafe impl AsBytes for GSP_ARGUMENTS_CACHED {}
-
-// SAFETY: This struct only contains integer types for which all bit patterns
-// are valid.
-unsafe impl FromBytes for GSP_ARGUMENTS_CACHED {}
-
-// SAFETY: Padding is explicit and will not contain uninitialized data.
-unsafe impl AsBytes for MESSAGE_QUEUE_INIT_ARGUMENTS {}
-
-// SAFETY: Padding is explicit and will not contain uninitialized data.
-unsafe impl AsBytes for GSP_SR_INIT_ARGUMENTS {}
 
 #[allow(unused)]
 pub(crate) struct GspMemObjects {
@@ -42,7 +27,7 @@ pub(crate) struct GspMemObjects {
     pub logintr: CoherentAllocation<u8>,
     pub logrm: CoherentAllocation<u8>,
     pub cmdq: GspCmdq,
-    rmargs: CoherentAllocation<GSP_ARGUMENTS_CACHED>,
+    rmargs: CoherentAllocation<GspArgumentsCached>,
 }
 
 /// Creates a self-mapping page table for `obj` at its beginning.
@@ -101,27 +86,9 @@ impl GspMemObjects {
         // Creates its own PTE array
         let cmdq = GspCmdq::new(dev)?;
         let rmargs =
-            create_coherent_dma_object::<GSP_ARGUMENTS_CACHED>(dev, "RMARGS", 1, &mut libos, 3)?;
-        let (shared_mem_phys_addr, cmd_queue_offset, stat_queue_offset) = cmdq.get_cmdq_offsets();
+            create_coherent_dma_object::<GspArgumentsCached>(dev, "RMARGS", 1, &mut libos, 3)?;
 
-        dma_write!(
-            rmargs[0].messageQueueInitArguments = MESSAGE_QUEUE_INIT_ARGUMENTS {
-                sharedMemPhysAddr: shared_mem_phys_addr,
-                pageTableEntryCount: cmdq.nr_ptes,
-                cmdQueueOffset: cmd_queue_offset,
-                statQueueOffset: stat_queue_offset,
-                ..Default::default()
-            }
-        )?;
-        dma_write!(
-            rmargs[0].srInitArguments = GSP_SR_INIT_ARGUMENTS {
-                oldLevel: 0,
-                flags: 0,
-                bInPMTransition: 0,
-                ..Default::default()
-            }
-        )?;
-        dma_write!(rmargs[0].bDmemStack = 1)?;
+        dma_write!(rmargs[0] = GspArgumentsCached::new(&cmdq))?;
 
         Ok(GspMemObjects {
             libos,
