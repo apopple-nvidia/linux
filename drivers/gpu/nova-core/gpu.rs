@@ -298,6 +298,8 @@ impl Gpu {
         let libos_handle = libos.libos_dma_handle();
 
         self.gsp_falcon.reset(bar)?;
+        // Should we actually boot here? IIUC there is nothing loaded in the falcon, so we just
+        // want to set the MBOX registers to the correct value?
         let (mbox0, mbox1) = self.gsp_falcon.boot(
             bar,
             Some(libos_handle as u32),
