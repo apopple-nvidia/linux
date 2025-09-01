@@ -10,7 +10,7 @@ use kernel::time::Delta;
 
 use crate::driver::Bar0;
 use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
-use crate::firmware::Firmware;
+use crate::firmware::gsp::GspFirmware;
 use crate::gsp::cmdq::{GspCmdq, GspMessageFromGsp};
 use crate::nvfw as fw;
 
@@ -74,7 +74,7 @@ pub(crate) struct GspSequencer<'a> {
     pub sec2_falcon: &'a Falcon<Sec2>,
     pub gsp_falcon: &'a Falcon<Gsp>,
     pub libos_dma_handle: u64,
-    pub fw: &'a Firmware,
+    pub gsp_fw: &'a GspFirmware,
     pub dev: &'a device::Device<device::Bound>,
 }
 
@@ -158,7 +158,7 @@ impl<'a, 'b> IntoIterator for &'b GspSequencer<'a> {
 impl<'a> GspSequencer<'a> {
     pub(crate) fn run(
         cmdq: &mut GspCmdq,
-        fw: &'a Firmware,
+        gsp_fw: &GspFirmware,
         libos_dma_handle: u64,
         gsp_falcon: &'a Falcon<Gsp>,
         sec2_falcon: &'a Falcon<Sec2>,
@@ -182,7 +182,7 @@ impl<'a> GspSequencer<'a> {
             sec2_falcon,
             gsp_falcon,
             libos_dma_handle,
-            fw,
+            gsp_fw,
             dev,
         };
 

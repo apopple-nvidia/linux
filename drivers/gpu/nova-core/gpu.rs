@@ -352,17 +352,15 @@ impl Gpu {
             self.gsp_falcon.is_riscv_active(bar)?,
         );
 
-        let libos_dma_handle = libos.libos_dma_handle();
-
         // Create and run the GSP sequencer
         gsp::sequencer::GspSequencer::run(
             &mut libos.cmdq,
-            &fw,
-            libos_dma_handle,
-            &gsp_falcon,
-            &sec2_falcon,
+            &gsp_fw,
+            libos_handle,
+            &self.gsp_falcon,
+            &self.sec2_falcon,
             pdev.as_ref(),
-            &bar,
+            bar,
             Delta::from_secs(10),
         )?;
 
