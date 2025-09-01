@@ -6,6 +6,8 @@ use crate::gpu::Gpu;
 
 #[pin_data]
 pub(crate) struct NovaCore {
+    // Placeholder for the real `Gsp` object once it is built.
+    pub(crate) gsp: (),
     #[pin]
     pub(crate) gpu: Gpu,
     _reg: auxiliary::Registration,
@@ -40,8 +42,14 @@ impl pci::Driver for NovaCore {
         )?;
 
         let this = KBox::pin_init(
-            try_pin_init!(Self {
+            try_pin_init!(&this in Self {
                 gpu <- Gpu::new(pdev, bar)?,
+                gsp <- {
+                    // SAFETY: `this.gpu` is initialized to a valid value.
+                    let gpu = unsafe { &(*this.as_ptr()).gpu };
+
+                    gpu.start_gsp(pdev)?
+                },
                 _reg: auxiliary::Registration::new(
                     pdev.as_ref(),
                     c_str!("nova-drm"),

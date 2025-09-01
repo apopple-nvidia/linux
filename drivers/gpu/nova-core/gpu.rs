@@ -172,6 +172,8 @@ pub(crate) struct Gpu {
     /// System memory page required for flushing all pending GPU-side memory writes done through
     /// PCIE into system memory, via sysmembar (A GPU-initiated HW memory-barrier operation).
     sysmem_flush: SysmemFlush,
+    gsp_falcon: Falcon<Gsp>,
+    sec2_falcon: Falcon<Sec2>,
 }
 
 impl Gpu {
@@ -181,8 +183,8 @@ impl Gpu {
     /// TODO: this needs to be moved into a larger type responsible for booting the whole GSP
     /// (`GspBooter`?).
     fn run_fwsec_frts(
+        &self,
         dev: &device::Device<device::Bound>,
-        falcon: &Falcon<Gsp>,
         bar: &Bar0,
         bios: &Vbios,
         fb_layout: &FbLayout,
@@ -199,7 +201,7 @@ impl Gpu {
 
         let fwsec_frts = FwsecFirmware::new(
             dev,
-            falcon,
+            &self.gsp_falcon,
             bar,
             bios,
             FwsecCommand::Frts {
@@ -209,7 +211,7 @@ impl Gpu {
         )?;
 
         // Run FWSEC-FRTS to create the WPR2 region.
-        fwsec_frts.run(dev, falcon, bar)?;
+        fwsec_frts.run(dev, &self.gsp_falcon, bar)?;
 
         // SCRATCH_E contains the error code for FWSEC-FRTS.
         let frts_status = regs::NV_PBUS_SW_SCRATCH_0E_FRTS_ERR::read(bar).frts_err_code();
@@ -254,6 +256,28 @@ impl Gpu {
         }
     }
 
+    /// Attempt to start the GSP.
+    ///
+    /// This is a GPU-dependent and complex procedure that involves loading firmware files from
+    /// user-space, patching them with signatures, and building firmware-specific intricate data
+    /// structures that the GSP will use at runtime.
+    ///
+    /// Upon return, the GSP is up and running, and its runtime object given as return value.
+    pub(crate) fn start_gsp(&self, pdev: &pci::Device<device::Bound>) -> Result<()> {
+        let dev = pdev.as_ref();
+
+        let bar = self.bar.access(dev)?;
+
+        let bios = Vbios::new(dev, bar)?;
+
+        let fb_layout = FbLayout::new(self.spec.chipset, bar)?;
+        dev_dbg!(dev, "{:#x?}\n", fb_layout);
+
+        self.run_fwsec_frts(dev, bar, &bios, &fb_layout)?;
+
+        Ok(())
+    }
+
     pub(crate) fn new(
         pdev: &pci::Device<device::Bound>,
         devres_bar: Arc<Devres<Bar0>>,
@@ -284,20 +308,15 @@ impl Gpu {
         )?;
         gsp_falcon.clear_swgen0_intr(bar);
 
-        let _sec2_falcon = Falcon::<Sec2>::new(pdev.as_ref(), spec.chipset, bar, true)?;
-
-        let fb_layout = FbLayout::new(spec.chipset, bar)?;
-        dev_dbg!(pdev.as_ref(), "{:#x?}\n", fb_layout);
-
-        let bios = Vbios::new(pdev.as_ref(), bar)?;
-
-        Self::run_fwsec_frts(pdev.as_ref(), &gsp_falcon, bar, &bios, &fb_layout)?;
+        let sec2_falcon = Falcon::<Sec2>::new(pdev.as_ref(), spec.chipset, bar, true)?;
 
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
             fw,
             sysmem_flush,
+            gsp_falcon,
+            sec2_falcon,
         }))
     }
 
