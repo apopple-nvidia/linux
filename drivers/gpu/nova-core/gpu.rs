@@ -9,7 +9,7 @@ use crate::fb::SysmemFlush;
 use crate::firmware::booter::{BooterFirmware, BooterKind};
 use crate::firmware::fwsec::{FwsecCommand, FwsecFirmware};
 use crate::firmware::gsp::GspFirmware;
-use crate::firmware::{Firmware, FIRMWARE_VERSION};
+use crate::firmware::FIRMWARE_VERSION;
 use crate::gfw;
 use crate::regs;
 use crate::vbios::Vbios;
@@ -179,7 +179,6 @@ pub(crate) struct Gpu {
     spec: Spec,
     /// MMIO mapping of PCI BAR 0
     bar: Arc<Devres<Bar0>>,
-    fw: Firmware,
     /// System memory page required for flushing all pending GPU-side memory writes done through
     /// PCIE into system memory, via sysmembar (A GPU-initiated HW memory-barrier operation).
     sysmem_flush: SysmemFlush,
@@ -309,7 +308,6 @@ impl Gpu {
     ) -> Result<impl PinInit<Self>> {
         let bar = devres_bar.access(pdev.as_ref())?;
         let spec = Spec::new(bar)?;
-        let fw = Firmware::new(pdev.as_ref(), spec.chipset, FIRMWARE_VERSION)?;
 
         dev_info!(
             pdev.as_ref(),
@@ -338,7 +336,6 @@ impl Gpu {
         Ok(pin_init!(Self {
             spec,
             bar: devres_bar,
-            fw,
             sysmem_flush,
             gsp_falcon,
             sec2_falcon,
