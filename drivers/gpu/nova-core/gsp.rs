@@ -99,7 +99,7 @@ impl GspMemObjects {
         create_pte_array(&mut logrm, 1);
 
         // Creates its own PTE array
-        let mut cmdq = GspCmdq::new(dev)?;
+        let cmdq = GspCmdq::new(dev)?;
         let rmargs =
             create_coherent_dma_object::<GSP_ARGUMENTS_CACHED>(dev, "RMARGS", 1, &mut libos, 3)?;
         let (shared_mem_phys_addr, cmd_queue_offset, stat_queue_offset) = cmdq.get_cmdq_offsets();
