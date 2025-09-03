@@ -87,7 +87,7 @@ impl GspMemObjects {
         create_pte_array(&mut logrm, 1);
 
         // Creates its own PTE array
-        let cmdq = GspCmdq::new(dev)?;
+        let mut cmdq = GspCmdq::new(dev)?;
         let rmargs =
             create_coherent_dma_object::<GspArgumentsCached>(dev, "RMARGS", 1, &mut libos, 3)?;
 
