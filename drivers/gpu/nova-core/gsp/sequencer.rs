@@ -25,9 +25,9 @@ impl GspMessageFromGsp for fw::rpc_run_cpu_sequencer_v17_00 {
 
 const CMD_SIZE: usize = size_of::<fw::GSP_SEQUENCER_BUFFER_CMD>();
 
-pub(crate) struct GspSequencerInfo<'a> {
-    pub info: &'a fw::rpc_run_cpu_sequencer_v17_00,
-    pub cmd_data: KVec<u8>,
+struct GspSequencerInfo<'a> {
+    info: &'a fw::rpc_run_cpu_sequencer_v17_00,
+    cmd_data: KVec<u8>,
 }
 
 /// GSP Sequencer Command types with payload data
@@ -69,13 +69,13 @@ impl GspSeqCmd {
 
 #[expect(dead_code)]
 pub(crate) struct GspSequencer<'a> {
-    pub seq_info: GspSequencerInfo<'a>,
-    pub bar: &'a Bar0,
-    pub sec2_falcon: &'a Falcon<Sec2>,
-    pub gsp_falcon: &'a Falcon<Gsp>,
-    pub libos_dma_handle: u64,
-    pub gsp_fw: &'a GspFirmware,
-    pub dev: &'a device::Device<device::Bound>,
+    seq_info: GspSequencerInfo<'a>,
+    bar: &'a Bar0,
+    sec2_falcon: &'a Falcon<Sec2>,
+    gsp_falcon: &'a Falcon<Gsp>,
+    libos_dma_handle: u64,
+    gsp_fw: &'a GspFirmware,
+    dev: &'a device::Device<device::Bound>,
 }
 
 pub(crate) trait GspSeqCmdRunner {
