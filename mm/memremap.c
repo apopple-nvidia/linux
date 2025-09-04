@@ -12,10 +12,13 @@
 #include <linux/types.h>
 #include <linux/wait_bit.h>
 #include <linux/xarray.h>
+#include <linux/maple_tree.h>
 #include "internal.h"
 
 static DEFINE_XARRAY(pgmap_array);
-
+struct maple_tree device_private_pgmap_tree =
+	MTREE_INIT(device_private_pgmap_tree, MT_FLAGS_ALLOC_RANGE);
+ 
 /*
  * The memremap() and memremap_pages() interfaces are alternately used
  * to map persistent memory namespaces. These interfaces place different
@@ -502,3 +505,15 @@ void zone_device_page_init(struct page *page)
 	lock_page(page);
 }
 EXPORT_SYMBOL_GPL(zone_device_page_init);
+
+int memremap_device_private_pagemap(struct dev_private_pagemap *pgmap)
+{
+	unsigned long startp;
+	int rc;
+
+	rc = mtree_alloc_range(&device_private_pgmap_tree, &startp, pgmap, pgmap->num_pages,
+			       0, ULONG_MAX, GFP_KERNEL);
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(memremap_device_private_pagemap);

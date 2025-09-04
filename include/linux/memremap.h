@@ -140,6 +140,13 @@ struct dev_pagemap {
 	};
 };
 
+struct dev_private_pagemap {
+	const struct dev_pagemap_ops *ops;
+	void *owner;
+	struct page *pages;
+	unsigned long num_pages;
+};
+
 static inline bool pgmap_has_memory_failure(struct dev_pagemap *pgmap)
 {
 	return pgmap->ops && pgmap->ops->memory_failure;
@@ -200,6 +207,7 @@ static inline bool folio_is_fsdax(const struct folio *folio)
 
 #ifdef CONFIG_ZONE_DEVICE
 void zone_device_page_init(struct page *page);
+int memremap_device_private_pagemap(struct dev_private_pagemap *pgmap);
 void *memremap_pages(struct dev_pagemap *pgmap, int nid);
 void memunmap_pages(struct dev_pagemap *pgmap);
 void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap);
