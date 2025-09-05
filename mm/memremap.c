@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 2015 Intel Corporation. All rights reserved. */
+#include "linux/export.h"
+#include "linux/mmdebug.h"
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/kasan.h>
@@ -506,14 +508,58 @@ void zone_device_page_init(struct page *page)
 }
 EXPORT_SYMBOL_GPL(zone_device_page_init);
 
-int memremap_device_private_pagemap(struct dev_private_pagemap *pgmap)
+/*
+ * Returns -1 on error
+ */
+unsigned long memremap_device_private_pagemap(struct dev_private_pagemap *pgmap)
 {
 	unsigned long startp;
 	int rc;
 
 	rc = mtree_alloc_range(&device_private_pgmap_tree, &startp, pgmap, pgmap->num_pages,
-			       0, ULONG_MAX, GFP_KERNEL);
+			       0, ULONG_MAX - 1, GFP_KERNEL);
+	pgmap->start_index = startp;
 
 	return rc;
 }
 EXPORT_SYMBOL_GPL(memremap_device_private_pagemap);
+
+void memunmap_device_private_pagemap(struct dev_private_pagemap *pgmap)
+{
+	mtree_erase(&device_private_pgmap_tree, pgmap->start_index);
+}
+EXPORT_SYMBOL_GPL(memunmap_device_private_pagemap);
+
+struct page *device_private_offset_to_page(unsigned long offset)
+{
+	struct dev_private_pagemap *pgmap;
+
+	pgmap = mtree_load(&device_private_pgmap_tree, offset);
+	if (WARN_ON_ONCE(!pgmap))
+		return NULL;
+
+	return &pgmap->pages[offset - pgmap->start_index];
+}
+EXPORT_SYMBOL_GPL(device_private_offset_to_page);
+
+struct page *device_private_entry_to_page(swp_entry_t entry)
+{
+	unsigned long offset;
+
+	if (!is_device_private_entry(entry))
+		return NULL;
+
+	offset = swp_offset_pfn(entry);
+
+	return device_private_offset_to_page(offset);
+}
+
+pgoff_t device_private_page_to_offset(struct page *page)
+{
+	struct dev_private_pagemap *pgmap = (struct dev_private_pagemap *) page_pgmap(page);
+
+	/* Not much else we can do as returning an invalid offset isn't safe */
+	VM_BUG_ON_PAGE(!is_device_private_page(page), page);
+
+	return (page - pgmap->pages) / sizeof(*page);
+}

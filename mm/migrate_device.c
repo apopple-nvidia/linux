@@ -140,7 +140,7 @@ again:
 			if (!is_device_private_entry(entry))
 				goto next;
 
-			page = pfn_swap_entry_to_page(entry);
+			page = device_private_entry_to_page(entry);
 			pgmap = page_pgmap(page);
 			if (!(migrate->flags &
 				MIGRATE_VMA_SELECT_DEVICE_PRIVATE) ||
@@ -636,10 +636,10 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 
 		if (vma->vm_flags & VM_WRITE)
 			swp_entry = make_writable_device_private_entry(
-						page_to_pfn(page));
+						device_private_page_to_offset(page));
 		else
 			swp_entry = make_readable_device_private_entry(
-						page_to_pfn(page));
+						device_private_page_to_offset(page));
 		entry = swp_entry_to_pte(swp_entry);
 	} else {
 		if (folio_is_zone_device(folio) &&

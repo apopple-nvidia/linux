@@ -843,7 +843,7 @@ copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			set_pte_at(src_mm, addr, src_pte, pte);
 		}
 	} else if (is_device_private_entry(entry)) {
-		page = pfn_swap_entry_to_page(entry);
+		page = device_private_entry_to_page(entry);
 		folio = page_folio(page);
 
 		/*
@@ -1595,7 +1595,7 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
 	entry = pte_to_swp_entry(ptent);
 	if (is_device_private_entry(entry) ||
 		is_device_exclusive_entry(entry)) {
-		struct page *page = pfn_swap_entry_to_page(entry);
+		struct page *page = device_private_entry_to_page(entry);
 		struct folio *folio = page_folio(page);
 
 		if (unlikely(!should_zap_folio(details, folio)))
@@ -4492,7 +4492,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				goto out;
 			}
 
-			vmf->page = pfn_swap_entry_to_page(entry);
+			vmf->page = device_private_entry_to_page(entry);
 			vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
 					vmf->address, &vmf->ptl);
 			if (unlikely(!vmf->pte ||

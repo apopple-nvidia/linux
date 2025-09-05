@@ -144,6 +144,7 @@ struct dev_private_pagemap {
 	const struct dev_pagemap_ops *ops;
 	void *owner;
 	struct page *pages;
+	unsigned long start_index;
 	unsigned long num_pages;
 };
 
@@ -163,6 +164,10 @@ static inline unsigned long pgmap_vmemmap_nr(struct dev_pagemap *pgmap)
 {
 	return 1 << pgmap->vmemmap_shift;
 }
+
+struct page *device_private_offset_to_page(unsigned long offset);
+struct page *device_private_entry_to_page(swp_entry_t entry);
+pgoff_t device_private_page_to_offset(struct page *page);
 
 static inline bool is_device_private_page(const struct page *page)
 {
@@ -207,7 +212,8 @@ static inline bool folio_is_fsdax(const struct folio *folio)
 
 #ifdef CONFIG_ZONE_DEVICE
 void zone_device_page_init(struct page *page);
-int memremap_device_private_pagemap(struct dev_private_pagemap *pgmap);
+unsigned long memremap_device_private_pagemap(struct dev_private_pagemap *pgmap);
+void memunmap_device_private_pagemap(struct dev_private_pagemap *pgmap);
 void *memremap_pages(struct dev_pagemap *pgmap, int nid);
 void memunmap_pages(struct dev_pagemap *pgmap);
 void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap);

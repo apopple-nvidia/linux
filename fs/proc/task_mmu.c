@@ -962,9 +962,12 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
 			}
 		} else if (is_pfn_swap_entry(swpent)) {
-			if (is_device_private_entry(swpent))
+			if (is_device_private_entry(swpent)) {
 				present = true;
-			page = pfn_swap_entry_to_page(swpent);
+				page = device_private_entry_to_page(swpent);
+			} else {
+				page = pfn_swap_entry_to_page(swpent);
+			}
 		}
 	} else {
 		smaps_pte_hole_lookup(addr, walk);
@@ -1881,8 +1884,12 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 			    (offset << MAX_SWAPFILES_SHIFT);
 		}
 		flags |= PM_SWAP;
-		if (is_pfn_swap_entry(entry))
-			page = pfn_swap_entry_to_page(entry);
+		if (is_pfn_swap_entry(entry)) {
+			if (is_device_private_entry(entry))
+				page = device_private_entry_to_page(entry);
+			else
+				page = pfn_swap_entry_to_page(entry);
+		}
 		if (pte_marker_entry_uffd_wp(entry))
 			flags |= PM_UFFD_WP;
 		if (is_guard_swp_entry(entry))

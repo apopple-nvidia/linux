@@ -495,7 +495,7 @@ fini:
 static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
                                           struct page **ppage)
 {
-	unsigned long pfn, pfn_first = 0, pfn_last = 0;
+	unsigned long pfn, pfn_first, pfn_last = 0;
 	struct dmirror_chunk *devmem;
 	int ret = -ENOMEM;
 
@@ -527,6 +527,11 @@ static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
 		mdevice->devmem_capacity = new_capacity;
 		mdevice->devmem_chunks = new_chunks;
 	}
+	ret = memremap_device_private_pagemap(&devmem->private_pagemap);
+	if (ret)
+		return -ENOMEM;
+	pfn_first = devmem->private_pagemap.start_index;
+	pfn_last = pfn_first + devmem->private_pagemap.num_pages;
 
 	devmem->mdevice = mdevice;
 	mdevice->devmem_chunks[mdevice->devmem_count++] = devmem;
@@ -541,8 +546,9 @@ static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
 
 	spin_lock(&mdevice->lock);
 	for (pfn = pfn_first; pfn < pfn_last; pfn++) {
-		struct page *page = pfn_to_page(pfn);
+		struct page *page = device_private_offset_to_page(pfn);
 
+		dump_page(page, "private");
 		page->zone_device_data = mdevice->free_pages;
 		mdevice->free_pages = page;
 	}
@@ -573,6 +579,7 @@ static int dmirror_allocate_chunk(struct dmirror_device *mdevice,
 
 	switch (mdevice->zone_device_type) {
 	case HMM_DMIRROR_MEMORY_DEVICE_PRIVATE:
+		devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
 		return dmirror_allocate_private_chunk(mdevice, ppage);
 		break;
 	case HMM_DMIRROR_MEMORY_DEVICE_COHERENT:
@@ -1314,10 +1321,11 @@ static void dmirror_device_remove_chunks(struct dmirror_device *mdevice)
 			spin_unlock(&mdevice->lock);
 
 			dmirror_device_evict_chunk(devmem);
-			memunmap_pages(&devmem->pagemap);
-			if (devmem->pagemap.type == MEMORY_DEVICE_PRIVATE)
-				release_mem_region(devmem->pagemap.range.start,
-						   range_len(&devmem->pagemap.range));
+			if (devmem->pagemap.type == MEMORY_DEVICE_PRIVATE) {
+				memunmap_device_private_pagemap(&devmem->private_pagemap);
+			} else {
+				memunmap_pages(&devmem->pagemap);
+			}
 			kfree(devmem);
 		}
 		mdevice->devmem_count = 0;
