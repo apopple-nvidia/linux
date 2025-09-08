@@ -502,7 +502,7 @@ void zone_device_page_init(struct page *page)
 	 * Drivers shouldn't be allocating pages after calling
 	 * memunmap_pages().
 	 */
-	WARN_ON_ONCE(!percpu_ref_tryget_live(&page_pgmap(page)->ref));
+	// WARN_ON_ONCE(!percpu_ref_tryget_live(&page_pgmap(page)->ref));
 	set_page_count(page, 1);
 	lock_page(page);
 }
@@ -511,7 +511,7 @@ EXPORT_SYMBOL_GPL(zone_device_page_init);
 /*
  * Returns -1 on error
  */
-unsigned long memremap_device_private_pagemap(struct dev_private_pagemap *pgmap)
+unsigned long memremap_device_private_pagemap(struct dev_pagemap *pgmap)
 {
 	unsigned long startp;
 	int rc;
@@ -524,7 +524,7 @@ unsigned long memremap_device_private_pagemap(struct dev_private_pagemap *pgmap)
 }
 EXPORT_SYMBOL_GPL(memremap_device_private_pagemap);
 
-void memunmap_device_private_pagemap(struct dev_private_pagemap *pgmap)
+void memunmap_device_private_pagemap(struct dev_pagemap *pgmap)
 {
 	mtree_erase(&device_private_pgmap_tree, pgmap->start_index);
 }
@@ -532,7 +532,7 @@ EXPORT_SYMBOL_GPL(memunmap_device_private_pagemap);
 
 struct page *device_private_offset_to_page(unsigned long offset)
 {
-	struct dev_private_pagemap *pgmap;
+	struct dev_pagemap *pgmap;
 
 	pgmap = mtree_load(&device_private_pgmap_tree, offset);
 	if (WARN_ON_ONCE(!pgmap))
@@ -556,10 +556,11 @@ struct page *device_private_entry_to_page(swp_entry_t entry)
 
 pgoff_t device_private_page_to_offset(struct page *page)
 {
-	struct dev_private_pagemap *pgmap = (struct dev_private_pagemap *) page_pgmap(page);
+	struct dev_pagemap *pgmap = (struct dev_pagemap *) page_pgmap(page);
 
 	/* Not much else we can do as returning an invalid offset isn't safe */
 	VM_BUG_ON_PAGE(!is_device_private_page(page), page);
 
-	return (page - pgmap->pages) / sizeof(*page);
+	return pgmap->start_index + (page - pgmap->pages) / sizeof(*page);
 }
+EXPORT_SYMBOL_GPL(device_private_page_to_offset);

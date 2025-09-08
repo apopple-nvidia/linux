@@ -138,11 +138,6 @@ struct dev_pagemap {
 		struct range range;
 		DECLARE_FLEX_ARRAY(struct range, ranges);
 	};
-};
-
-struct dev_private_pagemap {
-	const struct dev_pagemap_ops *ops;
-	void *owner;
 	struct page *pages;
 	unsigned long start_index;
 	unsigned long num_pages;
@@ -211,9 +206,12 @@ static inline bool folio_is_fsdax(const struct folio *folio)
 }
 
 #ifdef CONFIG_ZONE_DEVICE
+void __init_zone_device_page(struct page *page, unsigned long pfn,
+					  unsigned long zone_idx, int nid,
+					  struct dev_pagemap *pgmap);
 void zone_device_page_init(struct page *page);
-unsigned long memremap_device_private_pagemap(struct dev_private_pagemap *pgmap);
-void memunmap_device_private_pagemap(struct dev_private_pagemap *pgmap);
+unsigned long memremap_device_private_pagemap(struct dev_pagemap *pgmap);
+void memunmap_device_private_pagemap(struct dev_pagemap *pgmap);
 void *memremap_pages(struct dev_pagemap *pgmap, int nid);
 void memunmap_pages(struct dev_pagemap *pgmap);
 void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap);

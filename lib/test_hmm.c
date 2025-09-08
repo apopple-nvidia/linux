@@ -99,7 +99,6 @@ struct dmirror {
  */
 struct dmirror_chunk {
 	struct dev_pagemap	pagemap;
-	struct dev_private_pagemap private_pagemap;
 	struct dmirror_device	*mdevice;
 	bool remove;
 };
@@ -506,10 +505,11 @@ static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
 	if (!devmem)
 		return ret;
 
-	devmem->private_pagemap.num_pages = DEVMEM_CHUNK_SIZE / PAGE_SIZE;
-	devmem->private_pagemap.pages = kzalloc(sizeof(*devmem->private_pagemap.pages) * devmem->private_pagemap.num_pages, GFP_KERNEL);
-	devmem->private_pagemap.ops = &dmirror_devmem_ops;
-	devmem->private_pagemap.owner = mdevice;
+	devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
+	devmem->pagemap.num_pages = DEVMEM_CHUNK_SIZE / PAGE_SIZE;
+	devmem->pagemap.pages = kzalloc(sizeof(*devmem->pagemap.pages) * devmem->pagemap.num_pages, GFP_KERNEL);
+	devmem->pagemap.ops = &dmirror_devmem_ops;
+	devmem->pagemap.owner = mdevice;
 
 	mutex_lock(&mdevice->devmem_lock);
 
@@ -527,11 +527,11 @@ static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
 		mdevice->devmem_capacity = new_capacity;
 		mdevice->devmem_chunks = new_chunks;
 	}
-	ret = memremap_device_private_pagemap(&devmem->private_pagemap);
+	ret = memremap_device_private_pagemap(&devmem->pagemap);
 	if (ret)
 		return -ENOMEM;
-	pfn_first = devmem->private_pagemap.start_index;
-	pfn_last = pfn_first + devmem->private_pagemap.num_pages;
+	pfn_first = devmem->pagemap.start_index;
+	pfn_last = pfn_first + devmem->pagemap.num_pages;
 
 	devmem->mdevice = mdevice;
 	mdevice->devmem_chunks[mdevice->devmem_count++] = devmem;
@@ -548,7 +548,8 @@ static int dmirror_allocate_private_chunk(struct dmirror_device *mdevice,
 	for (pfn = pfn_first; pfn < pfn_last; pfn++) {
 		struct page *page = device_private_offset_to_page(pfn);
 
-		dump_page(page, "private");
+		__init_zone_device_page(page, pfn, ZONE_DEVICE, numa_node_id(), &devmem->pagemap);
+		page_folio(page)->pgmap = (void *) &devmem->pagemap;
 		page->zone_device_data = mdevice->free_pages;
 		mdevice->free_pages = page;
 	}
@@ -573,16 +574,16 @@ static int dmirror_allocate_chunk(struct dmirror_device *mdevice,
 	void *ptr;
 	int ret = -ENOMEM;
 
-	devmem = kzalloc(sizeof(*devmem), GFP_KERNEL);
-	if (!devmem)
-		return ret;
 
 	switch (mdevice->zone_device_type) {
 	case HMM_DMIRROR_MEMORY_DEVICE_PRIVATE:
-		devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
 		return dmirror_allocate_private_chunk(mdevice, ppage);
 		break;
 	case HMM_DMIRROR_MEMORY_DEVICE_COHERENT:
+		devmem = kzalloc(sizeof(*devmem), GFP_KERNEL);
+		if (!devmem)
+			return ret;
+
 		devmem->pagemap.range.start = (MINOR(mdevice->cdevice.dev) - 2) ?
 							spm_addr_dev0 :
 							spm_addr_dev1;
@@ -692,6 +693,7 @@ static struct page *dmirror_devmem_alloc_page(struct dmirror_device *mdevice)
 			goto error;
 	}
 
+	printk("init page 0x%lx / 0x%lx\n", device_private_page_to_offset(dpage), (unsigned long) dpage);
 	zone_device_page_init(dpage);
 	dpage->zone_device_data = rpage;
 	return dpage;
@@ -1322,7 +1324,7 @@ static void dmirror_device_remove_chunks(struct dmirror_device *mdevice)
 
 			dmirror_device_evict_chunk(devmem);
 			if (devmem->pagemap.type == MEMORY_DEVICE_PRIVATE) {
-				memunmap_device_private_pagemap(&devmem->private_pagemap);
+				memunmap_device_private_pagemap(&devmem->pagemap);
 			} else {
 				memunmap_pages(&devmem->pagemap);
 			}
