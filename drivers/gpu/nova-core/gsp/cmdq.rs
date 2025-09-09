@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 use core::mem::offset_of;
-use core::sync::atomic::{fence, Ordering};
 
 use kernel::alloc::flags::GFP_KERNEL;
 use kernel::device;
@@ -15,10 +14,11 @@ use crate::driver::Bar0;
 use crate::gsp::create_pte_array;
 use crate::gsp::{GSP_PAGE_SHIFT, GSP_PAGE_SIZE};
 use crate::nvfw::{
-    self, GspMsgElement, GspRpcHeader, NV_VGPU_MSG_EVENT_GSP_INIT_DONE,
-    NV_VGPU_MSG_EVENT_GSP_LOCKDOWN_NOTICE, NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD,
-    NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER, NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED,
-    NV_VGPU_MSG_EVENT_OS_ERROR_LOG, NV_VGPU_MSG_EVENT_POST_EVENT, NV_VGPU_MSG_EVENT_RC_TRIGGERED,
+    GspMsgElement, GspRpcHeader, MsgqRxHeader, MsgqTxHeader, MSGQ_NUM_PAGES,
+    NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_EVENT_GSP_LOCKDOWN_NOTICE,
+    NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD, NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER,
+    NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED, NV_VGPU_MSG_EVENT_OS_ERROR_LOG,
+    NV_VGPU_MSG_EVENT_POST_EVENT, NV_VGPU_MSG_EVENT_RC_TRIGGERED,
     NV_VGPU_MSG_EVENT_UCODE_LIBOS_PRINT, NV_VGPU_MSG_FUNCTION_ALLOC_CHANNEL_DMA,
     NV_VGPU_MSG_FUNCTION_ALLOC_CTX_DMA, NV_VGPU_MSG_FUNCTION_ALLOC_DEVICE,
     NV_VGPU_MSG_FUNCTION_ALLOC_MEMORY, NV_VGPU_MSG_FUNCTION_ALLOC_OBJECT,
@@ -41,9 +41,6 @@ pub(crate) trait GspMessageFromGsp: Sized {
     const FUNCTION: u32;
 }
 
-/// Number of GSP pages making the Msgq.
-const MSGQ_NUM_PAGES: u32 = 0x3f;
-
 #[repr(C, align(0x1000))]
 #[derive(Debug)]
 struct MsgqData {
@@ -54,73 +51,6 @@ struct MsgqData {
 // literal to specify the alignment above. So check that against the actual GSP
 // page size here.
 static_assert!(align_of::<MsgqData>() == GSP_PAGE_SIZE);
-
-/// TX header for setting up a command queue with the GSP.
-///
-/// # Invariants
-///
-/// [`Self::write_ptr`] is guaranteed to return a value in the range `0..NUM_PAGES`.
-#[repr(transparent)]
-#[derive(Debug)]
-struct MsgqTxHeader(nvfw::MsgqTxHeader);
-
-unsafe impl AsBytes for MsgqTxHeader {}
-
-impl MsgqTxHeader {
-    fn new(msgq_size: u32, rx_hdr_offset: u32) -> Self {
-        Self(nvfw::MsgqTxHeader::new(
-            msgq_size,
-            MSGQ_NUM_PAGES,
-            rx_hdr_offset,
-        ))
-    }
-
-    fn write_ptr(&self) -> u32 {
-        self.0.write_ptr()
-    }
-
-    /// Advance the write pointer by `elem_count` units, wrapping around the ring buffer if
-    /// necessary.
-    fn advance_write_ptr(&mut self, elem_count: u32) {
-        let wptr = self.write_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
-        self.0.set_write_ptr(wptr);
-
-        // Ensure all command data is visible before triggering the GSP read
-        fence(Ordering::SeqCst);
-    }
-}
-
-/// RX header for setting up a message queue with the GSP.
-///
-/// # Invariants
-///
-/// [`Self::read_ptr`] is guaranteed to return a value in the range `0..NUM_PAGES`.
-#[repr(transparent)]
-#[derive(Debug)]
-struct MsgqRxHeader(nvfw::MsgqRxHeader);
-
-unsafe impl AsBytes for MsgqRxHeader {}
-
-impl MsgqRxHeader {
-    fn new() -> Self {
-        Self(nvfw::MsgqRxHeader::new())
-    }
-
-    fn read_ptr(&self) -> u32 {
-        self.0.read_ptr()
-    }
-
-    /// Advance the read pointer by `elem_count` units, wrapping around the ring buffer if
-    /// necessary.
-    fn advance_read_ptr(&mut self, elem_count: u32) {
-        let rptr = self.read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
-
-        // Ensure read pointer is properly ordered
-        fence(Ordering::SeqCst);
-
-        self.0.set_read_ptr(rptr);
-    }
-}
 
 // There is no struct defined for this in the open-gpu-kernel-source headers.
 // Instead it is defined by code in GspMsgQueuesInit().
@@ -241,7 +171,7 @@ type GspQueueMessageData<'a, M> = (&'a M, Option<SBuffer<core::array::IntoIter<&
 
 impl<'a> GspQueueMessage<'a> {
     pub(crate) fn try_as<M: GspMessageFromGsp>(&'a self) -> Result<GspQueueMessageData<'a, M>> {
-        if self.rpc_header.function() != M::FUNCTION {
+        if self.rpc_header.function != M::FUNCTION {
             return Err(ERANGE);
         }
 
@@ -251,7 +181,7 @@ impl<'a> GspQueueMessage<'a> {
         let msg = unsafe { &*(self.slice_1.as_ptr().cast::<M>()) };
         let data = &self.slice_1[size_of::<M>()..];
         let data_size =
-            self.rpc_header.length() as usize - size_of::<GspRpcHeader>() - size_of::<M>();
+            self.rpc_header.length as usize - size_of::<GspRpcHeader>() - size_of::<M>();
         let sbuf = if data_size > 0 {
             Some(SBuffer::new_reader([data, self.slice_2.unwrap_or(&[])]))
         } else {
@@ -262,7 +192,7 @@ impl<'a> GspQueueMessage<'a> {
     }
 
     pub(crate) fn ack(self) -> Result {
-        self.cmdq.ack_msg(self.rpc_header.length())?;
+        self.cmdq.ack_msg(self.rpc_header.length)?;
 
         Ok(())
     }
@@ -364,24 +294,24 @@ impl GspCmdq {
         *msg_element = GspMsgElement::new(self.seq, size_of::<M>() + payload_size, M::FUNCTION);
         // TODO: maybe we can join the slices to simplify the sbuffer? Or just keep the original
         // areas...
-        msg_element.set_checksum(GspCmdq::calculate_checksum(SBuffer::new_reader([
+        msg_element.checkSum = GspCmdq::calculate_checksum(SBuffer::new_reader([
             msg_element.as_bytes(),
             cmd.as_bytes(),
             payload_1,
             payload_2,
-        ])));
+        ]));
 
-        let rpc_header = msg_element.rpc_header();
+        let rpc_header = &msg_element.rpc;
         dev_info!(
             &self.dev,
             "GSP RPC: send: seq# {}, function=0x{:x} ({}), length=0x{:x}\n",
             self.seq,
-            rpc_header.function(),
-            decode_gsp_function(rpc_header.function()),
-            rpc_header.length(),
+            rpc_header.function,
+            decode_gsp_function(rpc_header.function),
+            rpc_header.length,
         );
 
-        let elem_count = msg_element.elem_count();
+        let elem_count = msg_element.elemCount;
         self.seq += 1;
         self.gsp_mem.advance_write_ptr(elem_count);
         NV_PGSP_QUEUE_HEAD::default().set_address(0).write(bar);
@@ -457,24 +387,24 @@ impl GspCmdq {
 
         let msg_element =
             GspMsgElement::from_bytes(&msg_slice[0..size_of::<GspMsgElement>()]).ok_or(EINVAL)?;
-        let rpc_header = msg_element.rpc_header();
+        let rpc_header = &msg_element.rpc;
 
-        if rpc_header.length() >= self.msg_count << GSP_PAGE_SHIFT {
+        if rpc_header.length >= self.msg_count << GSP_PAGE_SHIFT {
             return Err(E2BIG);
         }
 
         // rpc.length includes the size of the GspRpcHeader. Remove it to make
         // the rest of the code a bit easier to follow.
-        let rpc_data_length = rpc_header.length() - size_of::<GspRpcHeader>() as u32;
+        let rpc_data_length = rpc_header.length - size_of::<GspRpcHeader>() as u32;
 
         // Log RPC receive with message type decoding
         dev_info!(
             self.dev,
             "GSP RPC: receive: seq# {}, function=0x{:x} ({}), length=0x{:x}\n",
-            rpc_header.sequence(),
-            rpc_header.function(),
-            decode_gsp_function(rpc_header.function()),
-            rpc_header.length(),
+            rpc_header.sequence,
+            rpc_header.function,
+            decode_gsp_function(rpc_header.function),
+            rpc_header.length,
         );
 
         // Should never happen if `wait_on_message()` has been called but we need to check.
@@ -513,7 +443,7 @@ impl GspCmdq {
             dev_err!(
                 self.dev,
                 "GSP RPC: receive: Call {} - bad checksum",
-                rpc_header.sequence()
+                rpc_header.sequence
             );
             return Err(EIO);
         }

@@ -6,6 +6,7 @@ mod r570_144;
 use r570_144 as bindings;
 
 use core::ops::Range;
+use core::sync::atomic::{fence, Ordering};
 
 use kernel::device;
 use kernel::dma::CoherentAllocation;
@@ -24,6 +25,9 @@ use crate::gpu::Chipset;
 use crate::gsp;
 use crate::gsp::cmdq::GspCmdq;
 use crate::gsp::GSP_PAGE_SIZE;
+
+/// Number of GSP pages making the Msgq.
+pub(crate) const MSGQ_NUM_PAGES: u32 = 0x3f;
 
 /// Dummy type to group methods related to heap parameters for running the GSP firmware.
 pub(crate) struct GspFwHeapParams(());
@@ -292,61 +296,93 @@ impl GspArgumentsCached {
     }
 }
 
-#[repr(transparent)]
-#[derive(Debug)]
-pub(crate) struct MsgqTxHeader(bindings::msgqTxHeader);
+pub(crate) type MsgqTxHeader = bindings::msgqTxHeader;
 
+unsafe impl AsBytes for MsgqTxHeader {}
+
+/// TX header for setting up a command queue with the GSP.
+///
+/// # Invariants
+///
+/// TODO: [`Self::write_ptr`] is guaranteed to return a value in the range `0..NUM_PAGES`.
 impl MsgqTxHeader {
-    pub(crate) fn new(msgq_size: u32, num_pages: u32, rx_hdr_offset: u32) -> Self {
-        Self(bindings::msgqTxHeader {
+    pub(crate) fn new(msgq_size: u32, rx_hdr_offset: u32) -> Self {
+        Self {
             version: 0,
             size: msgq_size,
             msgSize: GSP_PAGE_SIZE as u32,
-            msgCount: num_pages,
+            msgCount: MSGQ_NUM_PAGES,
             writePtr: 0,
             flags: 1,
             rxHdrOff: rx_hdr_offset,
             entryOff: GSP_PAGE_SIZE as u32,
-        })
+        }
     }
 
     /// Returns the current value of the write pointer.
     pub(crate) fn write_ptr(&self) -> u32 {
-        let ptr = (&self.0.writePtr) as *const u32;
+        let ptr = (&self.writePtr) as *const u32;
 
         unsafe { ptr.read_volatile() }
+    }
+
+    /// Advance the write pointer by `elem_count` units, wrapping around the ring buffer if
+    /// necessary.
+    pub(crate) fn advance_write_ptr(&mut self, elem_count: u32) {
+        let wptr = self.write_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
+        self.set_write_ptr(wptr);
+
+        // Ensure all command data is visible before triggering the GSP read
+        fence(Ordering::SeqCst);
     }
 
     pub(crate) fn set_write_ptr(&mut self, val: u32) {
-        let ptr = (&mut self.0.writePtr) as *mut u32;
+        let ptr = (&mut self.writePtr) as *mut u32;
         unsafe { ptr.write_volatile(val) }
     }
 }
 
-#[repr(transparent)]
-#[derive(Debug)]
-pub(crate) struct MsgqRxHeader(bindings::msgqRxHeader);
+pub(crate) type MsgqRxHeader = bindings::msgqRxHeader;
 
+unsafe impl AsBytes for MsgqRxHeader {}
+
+/// RX header for setting up a message queue with the GSP.
+///
+/// # Invariants
+///
+/// TODO: [`Self::read_ptr`] is guaranteed to return a value in the range `0..NUM_PAGES`.
 impl MsgqRxHeader {
     pub(crate) fn new() -> Self {
-        Self(Default::default())
+        Self {
+            ..Default::default()
+        }
     }
 
     pub(crate) fn read_ptr(&self) -> u32 {
-        let ptr = (&self.0.readPtr) as *const u32;
+        let ptr = (&self.readPtr) as *const u32;
 
         unsafe { ptr.read_volatile() }
     }
 
+    /// Advance the read pointer by `elem_count` units, wrapping around the ring buffer if
+    /// necessary.
+    pub(crate) fn advance_read_ptr(&mut self, elem_count: u32) {
+        let rptr = self.read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
+
+        // Ensure read pointer is properly ordered
+        fence(Ordering::SeqCst);
+
+        self.set_read_ptr(rptr);
+    }
+
     pub(crate) fn set_read_ptr(&mut self, val: u32) {
-        let ptr = (&mut self.0.readPtr) as *mut u32;
+        let ptr = (&mut self.readPtr) as *mut u32;
 
         unsafe { ptr.write_volatile(val) }
     }
 }
 
-#[repr(transparent)]
-pub(crate) struct GspRpcHeader(bindings::rpc_message_header_v);
+pub(crate) type GspRpcHeader = bindings::rpc_message_header_v;
 
 unsafe impl AsBytes for GspRpcHeader {}
 
@@ -354,7 +390,7 @@ unsafe impl FromBytes for GspRpcHeader {}
 
 impl GspRpcHeader {
     pub(crate) fn new(cmd_size: u32, function: u32) -> Self {
-        Self(bindings::rpc_message_header_v {
+        Self {
             // TODO: magic number
             header_version: 0x03000000,
             signature: bindings::NV_VGPU_MSG_SIGNATURE_VALID,
@@ -364,24 +400,11 @@ impl GspRpcHeader {
             rpc_result: 0xffffffff,
             rpc_result_private: 0xffffffff,
             ..Default::default()
-        })
-    }
-
-    pub(crate) fn sequence(&self) -> u32 {
-        self.0.sequence
-    }
-
-    pub(crate) fn function(&self) -> u32 {
-        self.0.function
-    }
-
-    pub(crate) fn length(&self) -> u32 {
-        self.0.length
+        }
     }
 }
 
-#[repr(transparent)]
-pub(crate) struct GspMsgElement(bindings::GSP_MSG_QUEUE_ELEMENT);
+pub(crate) type GspMsgElement = bindings::GSP_MSG_QUEUE_ELEMENT;
 
 unsafe impl AsBytes for GspMsgElement {}
 
@@ -389,31 +412,18 @@ unsafe impl FromBytes for GspMsgElement {}
 
 impl GspMsgElement {
     pub(crate) fn new(sequence: u32, cmd_size: usize, function: u32) -> Self {
-        Self(bindings::GSP_MSG_QUEUE_ELEMENT {
+        Self {
             seqNum: sequence,
             // TODO: overflow check and fallible div?
             elemCount: (size_of::<Self>() + cmd_size).div_ceil(GSP_PAGE_SIZE) as u32,
             // TODO: fallible conversion.
-            rpc: GspRpcHeader::new(cmd_size as u32, function).0,
+            rpc: GspRpcHeader::new(cmd_size as u32, function),
             ..Default::default()
-        })
-    }
-
-    pub(crate) fn rpc_header(&self) -> &GspRpcHeader {
-        unsafe { core::mem::transmute(&self.0.rpc) }
-    }
-
-    // TODO: Hack. Checksum should be automatically computed?
-    pub(crate) fn set_checksum(&mut self, checksum: u32) {
-        self.0.checkSum = checksum;
-    }
-
-    pub(crate) fn elem_count(&self) -> u32 {
-        self.0.elemCount
+        }
     }
 
     // Returns the total size of the message element, including its headers and payload.
     pub(crate) fn length(&self) -> usize {
-        size_of::<Self>() + self.rpc_header().length() as usize
+        size_of::<Self>() + self.rpc.length as usize
     }
 }
