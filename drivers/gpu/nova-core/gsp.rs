@@ -3,6 +3,7 @@
 mod boot;
 mod fw;
 
+use fw::GspArgumentsCached;
 pub(crate) use fw::{GspFwWprMeta, LibosParams};
 
 use kernel::alloc::flags::GFP_KERNEL;
@@ -37,6 +38,7 @@ pub(crate) struct Gsp {
     pub logintr: CoherentAllocation<u8>,
     pub logrm: CoherentAllocation<u8>,
     pub cmdq: Cmdq,
+    rmargs: CoherentAllocation<GspArgumentsCached>,
 }
 
 #[repr(C)]
@@ -93,12 +95,26 @@ impl Gsp {
 
         // Creates its own PTE array
         let cmdq = Cmdq::new(dev)?;
+        let rmargs = CoherentAllocation::<GspArgumentsCached>::alloc_coherent(
+            dev,
+            1,
+            GFP_KERNEL | __GFP_ZERO,
+        )?;
+        dma_write!(libos[3] = LibosMemoryRegionInitArgument::new("RMARGS", &rmargs))?;
+
+        dma_write!(
+            rmargs[0] = fw::GspArgumentsCached::new(
+                fw::MessageQueueInitArguments::new(&cmdq),
+                fw::GspSrInitArguments::new()
+            )
+        )?;
 
         Ok(try_pin_init!(Self {
             libos,
             loginit,
             logintr,
             logrm,
+            rmargs,
             cmdq,
         }))
     }
