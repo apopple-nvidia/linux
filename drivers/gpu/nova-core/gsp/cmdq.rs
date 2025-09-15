@@ -292,7 +292,6 @@ impl Cmdq {
         NV_PGSP_QUEUE_HEAD::default().set_address(0).write(bar);
     }
 
-    #[expect(unused)]
     pub(crate) fn send_gsp_command<M, E>(&mut self, bar: &Bar0, init: impl Init<M, E>) -> Result
     where
         M: CommandToGsp,
@@ -345,7 +344,6 @@ impl Cmdq {
         Ok(())
     }
 
-    #[expect(unused)]
     pub(crate) fn send_gsp_command_with_payload<M, E>(
         &mut self,
         bar: &Bar0,
