@@ -247,7 +247,6 @@ impl Cmdq {
         NV_PGSP_QUEUE_HEAD::default().set_address(0).write(bar);
     }
 
-    #[expect(unused)]
     pub(crate) fn send_gsp_command<M: CommandToGsp>(
         &mut self,
         bar: &Bar0,
