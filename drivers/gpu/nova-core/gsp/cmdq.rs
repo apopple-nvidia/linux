@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use core::mem::offset_of;
+use core::sync::atomic::fence;
+use core::sync::atomic::Ordering;
 
 use kernel::alloc::flags::GFP_KERNEL;
 use kernel::device;
 use kernel::dma::{CoherentAllocation, DmaAddress};
-use kernel::dma_write;
 use kernel::prelude::*;
 use kernel::sync::aref::ARef;
 use kernel::time::Delta;
 use kernel::transmute::{AsBytes, FromBytes};
+use kernel::{dma_read, dma_write};
 
 use super::fw::{
     NV_VGPU_MSG_EVENT_GSP_INIT_DONE, NV_VGPU_MSG_EVENT_GSP_LOCKDOWN_NOTICE,
@@ -38,7 +40,6 @@ pub(crate) trait GspCommandToGsp: Sized + FromBytes + AsBytes {
     const FUNCTION: u32;
 }
 
-#[expect(unused)]
 pub(crate) trait GspMessageFromGsp: Sized + FromBytes + AsBytes {
     const FUNCTION: u32;
 }
@@ -98,6 +99,7 @@ impl DmaGspMem {
         Ok(Self(gsp_mem))
     }
 
+    #[expect(unused)]
     fn dma_handle(&self) -> DmaAddress {
         self.0.dma_handle()
     }
@@ -125,11 +127,11 @@ impl DmaGspMem {
     }
 
     fn driver_write_area(&mut self) -> (&mut [[u8; GSP_PAGE_SIZE]], &mut [[u8; GSP_PAGE_SIZE]]) {
+        let tx = self.write_ptr() as usize;
+        let rx = self.read_ptr() as usize;
+
         // SAFETY: we will only access the driver-owned part of the shared memory.
         let gsp_mem = unsafe { self.access_mut() };
-
-        let tx = gsp_mem.cpuq.tx.write_ptr() as usize;
-        let rx = gsp_mem.gspq.rx.read_ptr() as usize;
         let (before_tx, after_tx) = gsp_mem.cpuq.msgq.data.split_at_mut(tx);
 
         if rx <= tx {
@@ -148,11 +150,11 @@ impl DmaGspMem {
     }
 
     fn driver_read_area(&self) -> (&[[u8; GSP_PAGE_SIZE]], &[[u8; GSP_PAGE_SIZE]]) {
+        let tx = self.write_ptr() as usize;
+        let rx = self.read_ptr() as usize;
+
         // SAFETY: we will only access the driver-owned part of the shared memory.
         let gsp_mem = unsafe { self.access() };
-
-        let tx = gsp_mem.gspq.tx.write_ptr() as usize;
-        let rx = gsp_mem.cpuq.rx.read_ptr() as usize;
         let (before_rx, after_rx) = gsp_mem.gspq.msgq.data.split_at(rx);
 
         if tx <= rx {
@@ -170,16 +172,35 @@ impl DmaGspMem {
         }
     }
 
+    fn write_ptr(&self) -> u32 {
+        let gsp_mem = &self.0;
+        dma_read!(gsp_mem[0].gspq.tx.writePtr).unwrap() % MSGQ_NUM_PAGES
+    }
+
     /// Inform the GSP that it can process `elem_count` new pages from the command queue.
     fn advance_write_ptr(&mut self, elem_count: u32) {
-        let gsp_mem = unsafe { self.access_mut() };
-        gsp_mem.cpuq.tx.advance_write_ptr(elem_count);
+        let gsp_mem = &self.0;
+        let wptr = self.write_ptr().wrapping_add(elem_count) & MSGQ_NUM_PAGES;
+        dma_write!(gsp_mem[0].gspq.tx.writePtr = wptr).unwrap();
+
+        // Ensure all command data is visible before triggering the GSP read
+        fence(Ordering::SeqCst);
+    }
+
+    fn read_ptr(&self) -> u32 {
+        let gsp_mem = &self.0;
+        dma_read!(gsp_mem[0].cpuq.rx.readPtr).unwrap() % MSGQ_NUM_PAGES
     }
 
     /// Inform the GSP that it can send `elem_count` new pages into the message queue.
     fn advance_read_ptr(&mut self, elem_count: u32) {
-        let gsp_mem = unsafe { self.access_mut() };
-        gsp_mem.cpuq.rx.advance_read_ptr(elem_count);
+        let gsp_mem = &self.0;
+        let rptr = self.read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
+
+        // Ensure read pointer is properly ordered
+        fence(Ordering::SeqCst);
+
+        dma_write!(gsp_mem[0].cpuq.rx.readPtr = rptr).unwrap();
     }
 }
 
@@ -213,6 +234,7 @@ impl GspCmdq {
         ((sum64 >> 32) as u32) ^ (sum64 as u32)
     }
 
+    #[expect(unused)]
     pub(crate) fn send_gsp_command<M: GspCommandToGsp>(
         &mut self,
         bar: &Bar0,
@@ -231,6 +253,8 @@ impl GspCmdq {
         }
 
         let (msg_header, cmd, payload_1, payload_2) = {
+            // TODO: find an alternative to as_flattened_mut()
+            #[allow(clippy::incompatible_msrv)]
             let (msg_header_slice, slice_1) = driver_area
                 .0
                 .as_flattened_mut()
@@ -238,6 +262,8 @@ impl GspCmdq {
             let msg_header = GspMsgElement::from_bytes_mut(msg_header_slice).ok_or(EINVAL)?;
             let (cmd_slice, payload_1) = slice_1.split_at_mut(size_of::<M>());
             let cmd = M::from_bytes_mut(cmd_slice).ok_or(EINVAL)?;
+            // TODO: find an alternative to as_flattened_mut()
+            #[allow(clippy::incompatible_msrv)]
             let payload_2 = driver_area.1.as_flattened_mut();
             // TODO: Replace this workaround to cut the payload size.
             let (payload_1, payload_2) = match payload_size.checked_sub(payload_1.len()) {
@@ -254,8 +280,6 @@ impl GspCmdq {
         init(cmd, sbuffer)?;
 
         *msg_header = GspMsgElement::new(self.seq, size_of::<M>() + payload_size, M::FUNCTION);
-        // TODO: maybe we can join the slices to simplify the sbuffer? Or just keep the original
-        // areas...
         msg_header.checkSum = GspCmdq::calculate_checksum(SBuffer::new_reader([
             msg_header.as_bytes(),
             cmd.as_bytes(),
@@ -289,6 +313,8 @@ impl GspCmdq {
     ) -> Result<R> {
         let (driver_area, msg_header, slice_1) = wait_on(timeout, || {
             let driver_area = self.gsp_mem.driver_read_area();
+            // TODO: find an alternative to as_flattened()
+            #[allow(clippy::incompatible_msrv)]
             let (msg_header_slice, slice_1) = driver_area
                 .0
                 .as_flattened()
@@ -306,6 +332,8 @@ impl GspCmdq {
 
         let (cmd_slice, payload_1) = slice_1.split_at(size_of::<M>());
         let cmd = M::from_bytes(cmd_slice).ok_or(EINVAL)?;
+        // TODO: find an alternative to as_flattened()
+        #[allow(clippy::incompatible_msrv)]
         let payload_2 = driver_area.1.as_flattened();
 
         // Log RPC receive with message type decoding

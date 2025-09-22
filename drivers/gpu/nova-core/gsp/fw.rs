@@ -6,8 +6,6 @@ mod r570_144;
 use r570_144 as bindings;
 
 use core::ops::Range;
-use core::sync::atomic::fence;
-use core::sync::atomic::Ordering;
 
 use kernel::dma::CoherentAllocation;
 use kernel::ptr::{Alignable, Alignment};
@@ -233,15 +231,14 @@ impl LibosMemoryRegionInitArgument {
     }
 }
 
-#[repr(transparent)]
-#[derive(Debug)]
-pub(crate) struct MsgqTxHeader(bindings::msgqTxHeader);
+pub(crate) type MsgqTxHeader = bindings::msgqTxHeader;
 
+// SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for MsgqTxHeader {}
 
 impl MsgqTxHeader {
     pub(crate) fn new(msgq_size: u32, rx_hdr_offset: u32) -> Self {
-        Self(bindings::msgqTxHeader {
+        Self {
             version: 0,
             size: msgq_size,
             msgSize: GSP_PAGE_SIZE as u32,
@@ -250,29 +247,7 @@ impl MsgqTxHeader {
             flags: 1,
             rxHdrOff: rx_hdr_offset,
             entryOff: GSP_PAGE_SIZE as u32,
-        })
-    }
-
-    /// Returns the current value of the write pointer.
-    pub(crate) fn write_ptr(&self) -> u32 {
-        let ptr = (&self.0.writePtr) as *const u32;
-
-        unsafe { ptr.read_volatile() }
-    }
-
-    pub(crate) fn set_write_ptr(&mut self, val: u32) {
-        let ptr = (&mut self.0.writePtr) as *mut u32;
-        unsafe { ptr.write_volatile(val) }
-    }
-
-    /// Advance the write pointer by `elem_count` units, wrapping around the ring buffer if
-    /// necessary.
-    pub(crate) fn advance_write_ptr(&mut self, elem_count: u32) {
-        let wptr = self.write_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
-        self.set_write_ptr(wptr);
-
-        // Ensure all command data is visible before triggering the GSP read
-        fence(Ordering::SeqCst);
+        }
     }
 }
 
@@ -281,47 +256,24 @@ impl MsgqTxHeader {
 /// # Invariants
 ///
 /// [`Self::read_ptr`] is guaranteed to return a value in the range `0..NUM_PAGES`.
-#[repr(transparent)]
-#[derive(Debug)]
-pub(crate) struct MsgqRxHeader(bindings::msgqRxHeader);
+pub(crate) type MsgqRxHeader = bindings::msgqRxHeader;
 
+// SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for MsgqRxHeader {}
 
 impl MsgqRxHeader {
     pub(crate) fn new() -> Self {
-        Self(Default::default())
-    }
-
-    pub(crate) fn read_ptr(&self) -> u32 {
-        let ptr = (&self.0.readPtr) as *const u32;
-
-        unsafe { ptr.read_volatile() % MSGQ_NUM_PAGES }
-    }
-
-    #[expect(unused)]
-    pub(crate) fn set_read_ptr(&mut self, val: u32) {
-        let ptr = (&mut self.0.readPtr) as *mut u32;
-
-        unsafe { ptr.write_volatile(val) }
-    }
-
-    /// Advance the read pointer by `elem_count` units, wrapping around the ring buffer if
-    /// necessary.
-    #[expect(unused)]
-    pub(crate) fn advance_read_ptr(&mut self, elem_count: u32) {
-        let rptr = self.read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
-
-        // Ensure read pointer is properly ordered
-        fence(Ordering::SeqCst);
-
-        self.set_read_ptr(rptr);
+        Default::default()
     }
 }
 
 pub(crate) type GspRpcHeader = bindings::rpc_message_header_v;
 
+// SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for GspRpcHeader {}
 
+// SAFETY: This struct only contains integer types for which all bit patterns
+// are valid.
 unsafe impl FromBytes for GspRpcHeader {}
 
 impl GspRpcHeader {
@@ -342,8 +294,11 @@ impl GspRpcHeader {
 
 pub(crate) type GspMsgElement = bindings::GSP_MSG_QUEUE_ELEMENT;
 
+// SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for GspMsgElement {}
 
+// SAFETY: This struct only contains integer types for which all bit patterns
+// are valid.
 unsafe impl FromBytes for GspMsgElement {}
 
 impl GspMsgElement {
