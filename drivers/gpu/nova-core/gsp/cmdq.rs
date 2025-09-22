@@ -127,8 +127,8 @@ impl DmaGspMem {
     }
 
     fn driver_write_area(&mut self) -> (&mut [[u8; GSP_PAGE_SIZE]], &mut [[u8; GSP_PAGE_SIZE]]) {
-        let tx = self.write_ptr() as usize;
-        let rx = self.read_ptr() as usize;
+        let tx = self.cpu_write_ptr() as usize;
+        let rx = self.gsp_read_ptr() as usize;
 
         // SAFETY: we will only access the driver-owned part of the shared memory.
         let gsp_mem = unsafe { self.access_mut() };
@@ -150,8 +150,8 @@ impl DmaGspMem {
     }
 
     fn driver_read_area(&self) -> (&[[u8; GSP_PAGE_SIZE]], &[[u8; GSP_PAGE_SIZE]]) {
-        let tx = self.write_ptr() as usize;
-        let rx = self.read_ptr() as usize;
+        let tx = self.gsp_write_ptr() as usize;
+        let rx = self.cpu_read_ptr() as usize;
 
         // SAFETY: we will only access the driver-owned part of the shared memory.
         let gsp_mem = unsafe { self.access() };
@@ -172,35 +172,45 @@ impl DmaGspMem {
         }
     }
 
-    fn write_ptr(&self) -> u32 {
+    fn gsp_write_ptr(&self) -> u32 {
         let gsp_mem = &self.0;
         dma_read!(gsp_mem[0].gspq.tx.writePtr).unwrap() % MSGQ_NUM_PAGES
     }
 
-    /// Inform the GSP that it can process `elem_count` new pages from the command queue.
-    fn advance_write_ptr(&mut self, elem_count: u32) {
+    fn gsp_read_ptr(&self) -> u32 {
         let gsp_mem = &self.0;
-        let wptr = self.write_ptr().wrapping_add(elem_count) & MSGQ_NUM_PAGES;
-        dma_write!(gsp_mem[0].gspq.tx.writePtr = wptr).unwrap();
-
-        // Ensure all command data is visible before triggering the GSP read
-        fence(Ordering::SeqCst);
+        dma_read!(gsp_mem[0].gspq.rx.readPtr).unwrap() % MSGQ_NUM_PAGES
     }
 
-    fn read_ptr(&self) -> u32 {
+    fn cpu_read_ptr(&self) -> u32 {
         let gsp_mem = &self.0;
         dma_read!(gsp_mem[0].cpuq.rx.readPtr).unwrap() % MSGQ_NUM_PAGES
     }
 
     /// Inform the GSP that it can send `elem_count` new pages into the message queue.
-    fn advance_read_ptr(&mut self, elem_count: u32) {
+    fn advance_cpu_read_ptr(&mut self, elem_count: u32) {
         let gsp_mem = &self.0;
-        let rptr = self.read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
+        let rptr = self.cpu_read_ptr().wrapping_add(elem_count) % MSGQ_NUM_PAGES;
 
         // Ensure read pointer is properly ordered
         fence(Ordering::SeqCst);
 
         dma_write!(gsp_mem[0].cpuq.rx.readPtr = rptr).unwrap();
+    }
+
+    fn cpu_write_ptr(&self) -> u32 {
+        let gsp_mem = &self.0;
+        dma_read!(gsp_mem[0].cpuq.tx.writePtr).unwrap() % MSGQ_NUM_PAGES
+    }
+
+    /// Inform the GSP that it can process `elem_count` new pages from the command queue.
+    fn advance_cpu_write_ptr(&mut self, elem_count: u32) {
+        let gsp_mem = &self.0;
+        let wptr = self.cpu_write_ptr().wrapping_add(elem_count) & MSGQ_NUM_PAGES;
+        dma_write!(gsp_mem[0].cpuq.tx.writePtr = wptr).unwrap();
+
+        // Ensure all command data is visible before triggering the GSP read
+        fence(Ordering::SeqCst);
     }
 }
 
@@ -299,7 +309,7 @@ impl GspCmdq {
 
         let elem_count = msg_header.elemCount;
         self.seq += 1;
-        self.gsp_mem.advance_write_ptr(elem_count);
+        self.gsp_mem.advance_cpu_write_ptr(elem_count);
         NV_PGSP_QUEUE_HEAD::default().set_address(0).write(bar);
 
         Ok(())
@@ -369,7 +379,7 @@ impl GspCmdq {
         };
 
         self.gsp_mem
-            .advance_read_ptr(msg_header.rpc.length.div_ceil(GSP_PAGE_SIZE as u32));
+            .advance_cpu_read_ptr(msg_header.rpc.length.div_ceil(GSP_PAGE_SIZE as u32));
         result
     }
 }
