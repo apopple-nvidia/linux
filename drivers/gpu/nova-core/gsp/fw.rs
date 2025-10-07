@@ -547,6 +547,7 @@ impl GspSrInitArguments {
 
 pub(crate) use r570_144::{
     rpc_run_cpu_sequencer_v17_00,
+    GspStaticConfigInfo_t,
 
     // GSP sequencer structures
     GSP_SEQUENCER_BUFFER_CMD,
