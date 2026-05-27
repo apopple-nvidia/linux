@@ -25,6 +25,13 @@ extern "C" {
  */
 #define NOVA_GETPARAM_VRAM_BAR_SIZE	0x1
 
+/*
+ * NOVA_GETPARAM_GPU_CHIPSET
+ *
+ * Query the GPU chipset architecture/implementation.
+ */
+#define NOVA_GETPARAM_GPU_CHIPSET	0x2
+
 /**
  * struct drm_nova_getparam - query GPU and driver metadata
  */

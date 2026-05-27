@@ -12,11 +12,11 @@ use kernel::{
     types::CovariantForLt, //
 };
 
+use crate::gpu::Chipset;
 use crate::gpu::Gpu;
 
 /// API handle for the auxiliary bus child drivers to interact with nova-core.
 pub struct NovaCoreApi<'bound> {
-    #[allow(dead_code)]
     pub(crate) gpu: Pin<&'bound Gpu<'bound>>,
 }
 
@@ -25,5 +25,10 @@ impl NovaCoreApi<'_> {
     /// by nova-core.
     pub fn of(adev: &auxiliary::Device<Bound>) -> Result<Pin<&NovaCoreApi<'_>>> {
         adev.registration_data::<CovariantForLt!(NovaCoreApi<'_>)>()
+    }
+
+    /// Returns the chipset of this GPU.
+    pub fn chipset(&self) -> Chipset {
+        self.gpu.spec.chipset
     }
 }

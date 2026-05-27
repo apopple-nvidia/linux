@@ -31,7 +31,6 @@ pub(crate) struct Nova<'bound> {
 
 /// DRM registration data, accessible from ioctl handlers via the registration guard.
 pub(crate) struct DrmRegData<'bound> {
-    #[allow(dead_code)]
     pub(crate) api: Pin<&'bound NovaCoreApi<'bound>>,
 }
 
