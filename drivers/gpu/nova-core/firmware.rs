@@ -33,7 +33,10 @@ pub(crate) mod fwsec;
 pub(crate) mod gsp;
 pub(crate) mod riscv;
 
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_570_144)]
 pub(crate) const FIRMWARE_VERSION: &str = "570.144";
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_580_159_04)]
+pub(crate) const FIRMWARE_VERSION: &str = "580.159.04";
 
 /// Requests the GPU firmware `name` suitable for `chipset`, with version `ver`.
 fn request_firmware(

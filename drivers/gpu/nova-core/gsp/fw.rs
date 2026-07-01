@@ -2,10 +2,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 pub(crate) mod commands;
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_570_144)]
 mod r570_144;
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_580_159_04)]
+mod r580_159_04;
 
 // Alias to avoid repeating the version number with every use.
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_570_144)]
 use r570_144 as bindings;
+#[cfg(CONFIG_NOVA_CORE_GSP_FW_580_159_04)]
+use r580_159_04 as bindings;
 
 use core::ops::Range;
 
