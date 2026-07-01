@@ -15,3 +15,19 @@ config NOVA_CORE
 	  This driver is work in progress and may not be functional.
 
 	  If M is selected, the module will be called nova-core.
+
+choice
+	prompt "GSP firmware version"
+	depends on NOVA_CORE
+	default NOVA_CORE_GSP_FW_580_159_04
+	help
+	  Select the version of the GSP firmware that Nova Core will
+	  request from the GPU and build its bindings against.
+
+config NOVA_CORE_GSP_FW_580_159_04
+	bool "580.159.04"
+
+config NOVA_CORE_GSP_FW_570_144
+	bool "570.144"
+
+endchoice
