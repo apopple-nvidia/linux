@@ -242,6 +242,14 @@ impl GetGspStaticInfoReply {
             .to_str()
             .map_err(GpuNameError::InvalidUtf8)
     }
+
+    /// Returns the total usable VRAM size in bytes, i.e. the summed lengths of all usable FB
+    /// regions.
+    pub(crate) fn vram_size(&self) -> u64 {
+        self.usable_fb_regions
+            .iter()
+            .fold(0, |size, region| size.saturating_add(region.end - region.start))
+    }
 }
 
 pub(crate) use fw::commands::PowerStateLevel;

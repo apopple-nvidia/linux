@@ -32,6 +32,13 @@ extern "C" {
  */
 #define NOVA_GETPARAM_GPU_CHIPSET	0x2
 
+/*
+ * NOVA_GETPARAM_VRAM_SIZE
+ *
+ * Query the total usable VRAM size in bytes.
+ */
+#define NOVA_GETPARAM_VRAM_SIZE	0x3
+
 /**
  * struct drm_nova_getparam - query GPU and driver metadata
  */
