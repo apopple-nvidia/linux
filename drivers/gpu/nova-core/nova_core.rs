@@ -13,6 +13,7 @@ use kernel::{
 #[macro_use]
 mod bitfield;
 
+pub mod api;
 mod driver;
 mod falcon;
 mod fb;
